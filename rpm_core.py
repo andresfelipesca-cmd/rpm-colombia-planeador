@@ -584,3 +584,125 @@ def comparar_politicas_multiescenario(cij: pd.DataFrame, demanda: pd.Series, set
             "demanda_incumplida_empirica": len(res_emp["demanda_incumplida"]) > 0,
         })
     return pd.DataFrame(filas)
+
+
+# --------------------------------------------------------------------------
+# 8. MODELO DE PROGRAMACIÓN MULTI-DÍA (horizonte móvil)
+# --------------------------------------------------------------------------
+def resolver_multidia(cij: pd.DataFrame, demanda_horizonte: pd.Series, setup: pd.Series,
+                       dias: int, cap_minutos: float = CAP_MINUTOS_DIA,
+                       tiempo_limite_seg: int = 120) -> dict:
+    """
+    Extiende el modelo de asignación a un horizonte de varios días. Decide
+    no solo qué máquina produce cada referencia, sino también EN QUÉ DÍA,
+    dentro de una ventana de planeación de `dias` días.
+
+    A diferencia del modelo diario, la restricción de demanda se relaja de
+    "cumplir la demanda cada día" a "cumplir la demanda acumulada del
+    horizonte completo" — lo que permite producir una referencia en un
+    solo día en un lote grande, en vez de fabricar un poco de las 200
+    referencias todos los días. Esto reduce drásticamente el número de
+    alistamientos necesarios por día, que es la restricción que hace
+    infactible el modelo de un solo día con el catálogo completo.
+
+    Conjuntos: I (referencias), J (máquinas), T = {1,...,dias}
+    Variables: X_ijt >= 0 (unidades de i en la máquina j el día t)
+               Y_ijt in {0,1} (1 si la máquina j produce i el día t)
+    Función objetivo: minimizar el tiempo total (producción + alistamiento)
+                       acumulado en todo el horizonte.
+    Restricciones:
+      - Cumplimiento de demanda acumulada: sum_{j,t} X_ijt >= D_i  ∀i
+      - Capacidad diaria por máquina: sum_i (C_ij X_ijt + S_j Y_ijt) <= Cap_j  ∀j,∀t
+      - Enlace: X_ijt <= D_i * Y_ijt  ∀i,j,t
+    """
+    productos = list(cij.index)
+    dias_lista = list(range(1, dias + 1))
+
+    prob = pulp.LpProblem("Programacion_MultiDia", pulp.LpMinimize)
+
+    X = pulp.LpVariable.dicts("X", (productos, MACHINES, dias_lista), lowBound=0)
+    Y = pulp.LpVariable.dicts("Y", (productos, MACHINES, dias_lista), cat="Binary")
+
+    prob += (
+        pulp.lpSum(cij.loc[i, j] * X[i][j][t] for i in productos for j in MACHINES for t in dias_lista)
+        + pulp.lpSum(setup[j] * Y[i][j][t] for i in productos for j in MACHINES for t in dias_lista)
+    )
+
+    # Cumplimiento de demanda ACUMULADA (no por día)
+    for i in productos:
+        prob += pulp.lpSum(X[i][j][t] for j in MACHINES for t in dias_lista) >= demanda_horizonte[i]
+
+    # Capacidad por máquina, cada día
+    for j in MACHINES:
+        for t in dias_lista:
+            prob += (
+                pulp.lpSum(cij.loc[i, j] * X[i][j][t] for i in productos)
+                + pulp.lpSum(setup[j] * Y[i][j][t] for i in productos)
+                <= cap_minutos
+            )
+
+    # Enlace X-Y (Big-M ajustado a la demanda del horizonte completo)
+    for i in productos:
+        for j in MACHINES:
+            for t in dias_lista:
+                prob += X[i][j][t] <= demanda_horizonte[i] * Y[i][j][t]
+
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=tiempo_limite_seg)
+    prob.solve(solver)
+
+    estado = pulp.LpStatus[prob.status]
+    gap_certificado = (estado == "Optimal")
+
+    filas = []
+    for t in dias_lista:
+        for j in MACHINES:
+            for i in productos:
+                cantidad = X[i][j][t].value() or 0.0
+                if cantidad > 1e-6:
+                    filas.append({"dia": t, "maquina": j, "producto": i, "unidades": cantidad})
+    plan = pd.DataFrame(filas)
+
+    utilizacion_dia_maquina = pd.DataFrame(0.0, index=dias_lista, columns=MACHINES)
+    setups_dia_maquina = pd.DataFrame(0, index=dias_lista, columns=MACHINES)
+    for t in dias_lista:
+        for j in MACHINES:
+            tiempo_prod = sum(cij.loc[i, j] * (X[i][j][t].value() or 0.0) for i in productos)
+            n_setups = sum(int(round(Y[i][j][t].value() or 0)) for i in productos)
+            utilizacion_dia_maquina.loc[t, j] = tiempo_prod + n_setups * setup[j]
+            setups_dia_maquina.loc[t, j] = n_setups
+
+    return {
+        "estado": estado,
+        "gap_certificado": gap_certificado,
+        "valor_objetivo": pulp.value(prob.objective),
+        "plan": plan,
+        "utilizacion_dia_maquina": utilizacion_dia_maquina,
+        "setups_dia_maquina": setups_dia_maquina,
+        "dias": dias,
+        "cap_minutos": cap_minutos,
+    }
+
+
+# --------------------------------------------------------------------------
+# 9. CALIBRACIÓN DE LA DEMANDA ESTIMADA (200 referencias)
+# --------------------------------------------------------------------------
+def calibrar_demanda_extendida(demanda_medida: pd.Series, demanda_estimada: pd.Series) -> dict:
+    """
+    Corrige el sesgo de la demanda estimada para las referencias fuera del
+    núcleo principal (calculada como ventas del semestre / días hábiles).
+
+    Se comparan las referencias que existen en ambas fuentes: la demanda
+    medida directamente (99 referencias principales) y la estimada por
+    ventas. La razón entre ambas —consistentemente superior a 1— revela
+    que el método de estimación por ventas sobreestima la demanda real, y
+    ese mismo factor se usa para corregir la demanda de las referencias
+    que no tienen medición directa.
+    """
+    comunes = demanda_medida.index.intersection(demanda_estimada.index)
+    factor_sesgo = demanda_estimada.loc[comunes].sum() / demanda_medida.loc[comunes].sum()
+    demanda_calibrada = demanda_estimada / factor_sesgo
+    return {
+        "factor_sesgo": factor_sesgo,
+        "demanda_calibrada": demanda_calibrada,
+        "n_referencias_comunes": len(comunes),
+    }

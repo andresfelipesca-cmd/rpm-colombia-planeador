@@ -22,13 +22,16 @@ from rpm_core import (
     MACHINES,
     analisis_cuello_de_botella,
     analisis_sensibilidad,
+    calibrar_demanda_extendida,
     cargar_datos,
+    cargar_datos_extendido,
     clusterizar_maquinas,
     clusterizar_productos,
     elbow_silhouette,
     politica_empirica,
     prueba_estadistica_clusters,
     resolver_asignacion,
+    resolver_multidia,
 )
 
 st.set_page_config(page_title="RPM Colombia — Planeador de Producción", layout="wide")
@@ -237,11 +240,12 @@ asignacion = resultado["asignacion"]
 util = resultado["utilizacion_min"]
 n_setups = resultado["n_setups"]
 
-tab_plan, tab_comp, tab_sens, tab_cuello = st.tabs([
+tab_plan, tab_comp, tab_sens, tab_cuello, tab_multi = st.tabs([
     "📋 Plan y utilización",
     "⚖️ Vs. política empírica",
     "📈 Sensibilidad a la demanda",
     "🚧 Cuello de botella",
+    "🗓️ Plan multi-día (200 refs)",
 ])
 
 # ---------------- TAB 1: Plan y utilización ----------------
@@ -349,3 +353,101 @@ with tab_cuello:
         st.success(f"**{top['maquina']}** es el cuello de botella real del sistema: "
                    f"cada 30 minutos adicionales de su capacidad reducen el tiempo "
                    f"total en {top['mejora_min_por_+30min_capacidad']:.2f} min.")
+
+# ---------------- TAB 5: Plan multi-día (200 referencias) ----------------
+with tab_multi:
+    st.write(
+        "Extiende el modelo a las **200 referencias del catálogo completo**, "
+        "repartiendo la producción en varios días en vez de intentar meterlas "
+        "todas en uno solo. Corrige, además, un sesgo detectado en la manera "
+        "de estimar la demanda de las referencias que no tienen medición "
+        "directa (ventas del semestre ÷ días hábiles), que sobreestimaba la "
+        "demanda real."
+    )
+
+    dias_habiles_input = st.number_input(
+        "Días hábiles usados para estimar la demanda (a partir de ventas del semestre)",
+        min_value=60, max_value=300, value=180, step=10,
+    )
+    dias_horizonte = st.slider("Días del horizonte de planeación", 2, 7, 3)
+    tiempo_limite_multi = st.slider(
+        "Tiempo máximo de cómputo del solver multi-día (seg)", 30, 300, 120,
+        help="El modelo multi-día es más grande (200 referencias x 10 máquinas x N días); "
+             "puede tardar más que el modelo diario.",
+    )
+
+    if st.button("🗓️ Calcular plan multi-día", type="primary"):
+        with st.spinner("Cargando el catálogo completo (200 referencias)..."):
+            datos_200 = cargar_datos_extendido(
+                archivo if archivo is not None else "AnexodeDatosxlsx.xlsx",
+                dias_habiles=dias_habiles_input,
+            )
+        cij_200, demanda_200, setup_200 = datos_200["cij"], datos_200["demanda"], datos_200["setup"]
+
+        cal = calibrar_demanda_extendida(demanda, demanda_200)
+        st.info(
+            f"Se detectó un factor de sobreestimación de **{cal['factor_sesgo']:.2f}x** "
+            f"al comparar las {cal['n_referencias_comunes']} referencias que existen en "
+            f"ambas fuentes de datos. La demanda de las 200 referencias se corrigió "
+            f"dividiendo por ese factor antes de resolver el modelo."
+        )
+        demanda_horizonte = cal["demanda_calibrada"] * dias_horizonte
+
+        with st.spinner(f"Resolviendo el modelo multi-día ({dias_horizonte} días, "
+                         f"{len(cij_200)} referencias)... puede tardar 1-3 minutos."):
+            res_multi = resolver_multidia(
+                cij_200, demanda_horizonte, setup_200,
+                dias=dias_horizonte, cap_minutos=cap_min, tiempo_limite_seg=tiempo_limite_multi,
+            )
+        st.session_state["resultado_multi"] = res_multi
+
+    res_multi = st.session_state.get("resultado_multi")
+
+    if res_multi is None:
+        st.warning("Da clic en **Calcular plan multi-día** para resolver el modelo.")
+    else:
+        estado_txt = res_multi["estado"]
+        if estado_txt == "Optimal":
+            st.success(
+                f"Estado del solver: **{estado_txt}** (GAP = 0 %, óptimo certificado) — "
+                f"las 200 referencias caben en el horizonte de {res_multi['dias']} días. "
+                f"Tiempo total: **{res_multi['valor_objetivo']:.0f} min**."
+            )
+        elif estado_txt == "Infeasible":
+            st.error(
+                f"Estado del solver: **{estado_txt}** — con {res_multi['dias']} días el "
+                f"catálogo completo no alcanza a caber. Prueba a aumentar el horizonte "
+                f"(por ejemplo, a 4 o 5 días)."
+            )
+        else:
+            st.warning(f"Estado del solver: **{estado_txt}** — sube el tiempo límite del solver.")
+
+        if len(res_multi["plan"]) > 0:
+            st.subheader("Utilización por día y máquina (%)")
+            util_pct = (res_multi["utilizacion_dia_maquina"] / res_multi["cap_minutos"] * 100).round(1)
+            st.dataframe(
+                util_pct.style.background_gradient(cmap="RdYlGn_r", vmin=0, vmax=100).format("{:.1f}%"),
+                use_container_width=True,
+            )
+
+            st.subheader("Alistamientos (setups) por día y máquina")
+            st.dataframe(res_multi["setups_dia_maquina"], use_container_width=True)
+
+            st.subheader("Plan de producción — qué, dónde y cuándo")
+            dia_ver = st.selectbox("Ver el plan del día:", sorted(res_multi["plan"]["dia"].unique()))
+            plan_dia = res_multi["plan"][res_multi["plan"]["dia"] == dia_ver].copy()
+            plan_dia = plan_dia.sort_values("unidades", ascending=False)
+            plan_dia["unidades"] = plan_dia["unidades"].round(0)
+            st.dataframe(plan_dia[["maquina", "producto", "unidades"]], use_container_width=True, hide_index=True)
+
+            buffer_multi = io.BytesIO()
+            with pd.ExcelWriter(buffer_multi, engine="openpyxl") as writer:
+                res_multi["plan"].round(1).to_excel(writer, sheet_name="Plan_MultiDia", index=False)
+                util_pct.to_excel(writer, sheet_name="Utilizacion_Dia_Maquina")
+                res_multi["setups_dia_maquina"].to_excel(writer, sheet_name="Setups_Dia_Maquina")
+            st.download_button(
+                "⬇️ Descargar plan multi-día en Excel",
+                data=buffer_multi.getvalue(),
+                file_name="plan_multidia_rpm.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
