@@ -1,20 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-app.py — Planeador de Producción RPM Colombia (prototipo)
+app.py — Planeador de Producción RPM Colombia (dashboard profesional)
 
 Cómo correrlo:
-    pip install streamlit pandas openpyxl scikit-learn pulp matplotlib
+    pip install streamlit pandas openpyxl scikit-learn pulp plotly
     streamlit run app.py
-
-Sube el mismo Excel anexo de la tesis (o edítalo con la demanda del día)
-y la app calcula, en segundos, qué producir en cada máquina y muestra
-la utilización de capacidad y la segmentación de productos.
 """
 
 import io
 
-import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from rpm_core import (
@@ -34,18 +31,160 @@ from rpm_core import (
     resolver_multidia,
 )
 
-st.set_page_config(page_title="RPM Colombia — Planeador de Producción", layout="wide")
+st.set_page_config(page_title="RPM Colombia — Planeador de Producción", layout="wide",
+                    page_icon="🏭", initial_sidebar_state="expanded")
+
+# ==========================================================================
+# PALETA Y ESTILO
+# ==========================================================================
+BG = "#0E1117"
+CARD_BG = "#161B26"
+CARD_BORDER = "#232938"
+TEXT = "#E6E8EC"
+MUTED = "#8A94A6"
+ACCENT = "#3DA5D9"
+TEAL = "#33C2A3"
+SUCCESS = "#2ECC71"
+WARNING = "#F5A623"
+DANGER = "#E9576B"
+NAVY = "#223B5E"
+
+PLOTLY_TEMPLATE = "plotly_dark"
+FONT = dict(family="Segoe UI, -apple-system, sans-serif", color=TEXT)
+
+st.markdown(f"""
+<style>
+    .block-container {{ padding-top: 1.4rem; }}
+    div[data-testid="stMetric"] {{
+        background: {CARD_BG};
+        border: 1px solid {CARD_BORDER};
+        border-radius: 10px;
+        padding: 14px 16px 10px 16px;
+    }}
+    div[data-testid="stMetricLabel"] {{ color: {MUTED} !important; font-size: 0.85rem; }}
+    .kpi-title {{
+        font-size: 0.95rem; color: {MUTED}; text-transform: uppercase;
+        letter-spacing: 0.04em; margin-bottom: 2px;
+    }}
+    .section-card {{
+        background: {CARD_BG}; border: 1px solid {CARD_BORDER};
+        border-radius: 12px; padding: 18px 20px; margin-bottom: 14px;
+    }}
+    .badge-ok {{ background: rgba(46,204,113,0.15); color: {SUCCESS};
+                 padding: 3px 10px; border-radius: 20px; font-weight: 600; font-size: 0.85rem; }}
+    .badge-warn {{ background: rgba(245,166,35,0.15); color: {WARNING};
+                   padding: 3px 10px; border-radius: 20px; font-weight: 600; font-size: 0.85rem; }}
+    .badge-bad {{ background: rgba(233,87,107,0.15); color: {DANGER};
+                  padding: 3px 10px; border-radius: 20px; font-weight: 600; font-size: 0.85rem; }}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("🏭 Planeador de Producción — RPM Colombia")
 st.caption(
-    "Prototipo de apoyo a la decisión: a partir de los tiempos históricos "
-    "por máquina y la demanda del día, recomienda cuánto producir en cada "
-    "máquina y agrupa los productos por su rol óptimo en planta."
+    "Prototipo de apoyo a la decisión: a partir de los tiempos históricos por máquina y "
+    "la demanda del día, recomienda cuánto producir en cada máquina y agrupa los "
+    "productos por su rol óptimo en planta."
 )
 
-# --------------------------------------------------------------------
+
+# ==========================================================================
+# Helpers de gráficos Plotly
+# ==========================================================================
+def fig_layout(fig, title=None, height=380, **kw):
+    margen = kw.pop("margin", dict(l=40, r=20, t=50 if title else 20, b=40))
+    layout_kwargs = dict(
+        template=PLOTLY_TEMPLATE, paper_bgcolor=CARD_BG, plot_bgcolor=CARD_BG,
+        font=FONT, height=height, margin=margen,
+    )
+    if title:
+        # Solo se incluye la clave "title" cuando hay texto real. Pasar
+        # title=None explícitamente a update_layout() activa un bug de la
+        # versión de Plotly.js empaquetada con Streamlit que muestra el
+        # texto literal "undefined" en los gráficos tipo Indicator.
+        layout_kwargs["title"] = dict(text=title, font=dict(size=15, color=TEXT))
+    layout_kwargs.update(kw)
+    fig.update_layout(**layout_kwargs)
+    return fig
+
+
+def grafico_utilizacion(util, cap, cuello_top=None):
+    colores = [DANGER if v >= cap * 0.98 else (WARNING if v >= cap * 0.85 else ACCENT) for v in util.values]
+    if cuello_top:
+        colores = [WARNING if m == cuello_top else c for m, c in zip(util.index, colores)]
+    fig = go.Figure()
+    fig.add_bar(x=util.index, y=util.values, marker_color=colores,
+                text=[f"{v:,.0f}" for v in util.values], textposition="outside",
+                textfont=dict(color=TEXT, size=11))
+    fig.add_hline(y=cap, line_dash="dash", line_color=DANGER,
+                   annotation_text=f"Capacidad ({cap:,.0f} min)", annotation_font_color=DANGER)
+    fig.update_yaxes(title="Minutos utilizados", gridcolor=CARD_BORDER, range=[0, cap * 1.18])
+    fig.update_xaxes(title="Máquina")
+    return fig_layout(fig, "Utilización de capacidad por máquina")
+
+
+def gauge(valor, titulo, sufijo="%", rango=(0, 100), umbral_bueno=90, umbral_malo=70, invertido=False):
+    if invertido:
+        color = SUCCESS if valor <= (100 - umbral_bueno) else (WARNING if valor <= (100 - umbral_malo) else DANGER)
+    else:
+        color = SUCCESS if valor >= umbral_bueno else (WARNING if valor >= umbral_malo else DANGER)
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=valor,
+        number={"suffix": sufijo, "font": {"size": 30, "color": TEXT}},
+        gauge={
+            "axis": {"range": rango, "tickcolor": MUTED, "tickfont": {"color": MUTED, "size": 9}},
+            "bar": {"color": color, "thickness": 0.75},
+            "bgcolor": CARD_BORDER,
+            "borderwidth": 0,
+        },
+    ))
+    # Nota: el título NO se pasa dentro del Indicator porque una versión de
+    # Plotly.js empaquetada con Streamlit tiene un bug conocido que muestra
+    # el texto literal "undefined" junto al título cuando se usa la
+    # propiedad "title" de un Indicator tipo gauge. En su lugar, el título
+    # se dibuja como texto de Streamlit justo encima del gráfico (ver
+    # función gauge_con_titulo).
+    return fig_layout(fig, height=170, margin=dict(l=20, r=20, t=10, b=10))
+
+
+def gauge_con_titulo(valor, titulo, **kwargs):
+    st.markdown(
+        f'<p style="color:{MUTED};font-size:13px;margin:6px 0 -6px 4px;'
+        f'text-transform:uppercase;letter-spacing:0.03em">{titulo}</p>',
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(gauge(valor, titulo, **kwargs), use_container_width=True)
+
+
+def donut(labels, values, colores, titulo=None):
+    fig = go.Figure(go.Pie(
+        labels=labels, values=values, hole=0.58, marker=dict(colors=colores, line=dict(color=CARD_BG, width=2)),
+        textinfo="percent", textfont=dict(color=TEXT, size=12),
+    ))
+    fig.update_layout(showlegend=True, legend=dict(font=dict(color=TEXT, size=11), orientation="v"))
+    return fig_layout(fig, titulo, height=320)
+
+
+def heatmap_utilizacion(tabla_pct, titulo):
+    fig = go.Figure(go.Heatmap(
+        z=tabla_pct.values, x=tabla_pct.columns.tolist(), y=[f"Día {d}" for d in tabla_pct.index],
+        colorscale=[[0, "#1F6E5C"], [0.7, "#F5A623"], [1, "#E9576B"]],
+        zmin=0, zmax=100, text=tabla_pct.values.round(1), texttemplate="%{text}%",
+        textfont=dict(size=10, color=TEXT), colorbar=dict(title="%", tickfont=dict(color=TEXT)),
+    ))
+    fig.update_xaxes(title="Máquina", side="top")
+    fig.update_yaxes(title="", autorange="reversed")
+    return fig_layout(fig, titulo, height=120 + 45 * len(tabla_pct))
+
+
+def badge(texto, tipo="ok"):
+    clase = {"ok": "badge-ok", "warn": "badge-warn", "bad": "badge-bad"}[tipo]
+    st.markdown(f'<span class="{clase}">{texto}</span>', unsafe_allow_html=True)
+
+
+# ==========================================================================
 # Barra lateral — datos y parámetros
-# --------------------------------------------------------------------
+# ==========================================================================
 st.sidebar.header("1. Datos de entrada")
 
 archivo = st.sidebar.file_uploader(
@@ -60,7 +199,7 @@ cap_min = st.sidebar.number_input(
 n_clusters = st.sidebar.slider("Número de grupos (clustering de productos)", 2, 5, 3)
 tiempo_limite = st.sidebar.slider("Tiempo máximo de cómputo del solver (seg)", 10, 180, 60)
 
-correr = st.sidebar.button("🚀 Calcular plan de producción", type="primary")
+correr = st.sidebar.button("🚀 Calcular plan de producción", type="primary", use_container_width=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -86,7 +225,9 @@ cij, demanda, setup = datos["cij"], datos["demanda"], datos["setup"]
 col1, col2, col3 = st.columns(3)
 col1.metric("Referencias cargadas", len(cij))
 col2.metric("Máquinas", len(MACHINES))
-col3.metric("Demanda total del día (unid.)", f"{int(demanda.sum()):,}")
+col3.metric("Demanda total del día (unid.)", f"{int(demanda.sum()):,}".replace(",", "."))
+
+st.divider()
 
 # --------------------------------------------------------------------
 # Sección: clustering de productos y máquinas (validado)
@@ -109,19 +250,23 @@ with tab_prod:
 
     c1, c2 = st.columns(2)
     with c1:
-        fig_e, ax_e = plt.subplots(figsize=(5, 3.5))
-        ax_e.plot(tabla_k_prod["k"], tabla_k_prod["inercia"], marker="o")
-        ax_e.set_xlabel("k (número de grupos)")
-        ax_e.set_ylabel("Inercia")
-        ax_e.set_title("Método del codo")
-        st.pyplot(fig_e)
+        fig_e = go.Figure()
+        fig_e.add_scatter(x=tabla_k_prod["k"], y=tabla_k_prod["inercia"], mode="lines+markers",
+                           line=dict(color=ACCENT, width=2.5), marker=dict(size=8))
+        fig_e.update_xaxes(title="k (número de grupos)", gridcolor=CARD_BORDER)
+        fig_e.update_yaxes(title="Inercia", gridcolor=CARD_BORDER)
+        st.plotly_chart(fig_layout(fig_e, "Método del codo", height=300), use_container_width=True)
     with c2:
-        fig_s, ax_s = plt.subplots(figsize=(5, 3.5))
-        ax_s.plot(tabla_k_prod["k"], tabla_k_prod["silhouette"], marker="o", color="#2E7D32")
-        ax_s.set_xlabel("k (número de grupos)")
-        ax_s.set_ylabel("Silhouette Score")
-        ax_s.set_title("Validación por Silhouette")
-        st.pyplot(fig_s)
+        mejor_k_i = int(tabla_k_prod.loc[tabla_k_prod["silhouette"].idxmax(), "k"])
+        fig_s = go.Figure()
+        fig_s.add_scatter(x=tabla_k_prod["k"], y=tabla_k_prod["silhouette"], mode="lines+markers",
+                           line=dict(color=TEAL, width=2.5), marker=dict(size=8))
+        fig_s.add_scatter(x=[mejor_k_i], y=[tabla_k_prod["silhouette"].max()], mode="markers",
+                           marker=dict(size=14, color=DANGER), name=f"Mejor k={mejor_k_i}")
+        fig_s.update_xaxes(title="k (número de grupos)", gridcolor=CARD_BORDER)
+        fig_s.update_yaxes(title="Silhouette Score", gridcolor=CARD_BORDER)
+        fig_s.update_layout(showlegend=False)
+        st.plotly_chart(fig_layout(fig_s, "Validación por Silhouette", height=300), use_container_width=True)
 
     mejor_k = int(tabla_k_prod.loc[tabla_k_prod["silhouette"].idxmax(), "k"])
     st.caption(f"El mejor k según Silhouette es **{mejor_k}**. Se muestra el resultado con k={n_clusters} "
@@ -129,35 +274,44 @@ with tab_prod:
 
     clusters = clusterizar_productos(cij, demanda, n_clusters=n_clusters)
 
+    ROLES_COLOR = {
+        "Producción continua (alto volumen)": TEAL,
+        "Rotación media": ACCENT,
+        "Comodín / baja escala": WARNING,
+    }
+
     c3, c4 = st.columns([1, 2])
     with c3:
         conteo = clusters["rol_sugerido"].value_counts()
-        fig, ax = plt.subplots(figsize=(4, 4))
-        ax.pie(conteo.values, labels=conteo.index, autopct="%1.0f%%", startangle=90)
-        ax.set_title("Distribución de productos por rol sugerido")
-        st.pyplot(fig)
+        colores_d = [ROLES_COLOR.get(r, MUTED) for r in conteo.index]
+        st.plotly_chart(donut(conteo.index, conteo.values, colores_d, "Distribución por rol"),
+                         use_container_width=True)
     with c4:
-        fig2, ax2 = plt.subplots(figsize=(6, 4))
+        fig2 = go.Figure()
         for rol, sub in clusters.groupby("rol_sugerido"):
-            ax2.scatter(sub["demanda"], sub["cv_tiempo"], label=rol, alpha=0.7)
-        ax2.set_xlabel("Demanda diaria (unidades)")
-        ax2.set_ylabel("Variabilidad del tiempo entre máquinas (CV)")
-        ax2.set_title("Mapa de productos: volumen vs. variabilidad")
-        ax2.legend(fontsize=8)
-        st.pyplot(fig2)
+            fig2.add_scatter(x=sub["demanda"], y=sub["cv_tiempo"], mode="markers", name=rol,
+                              marker=dict(size=9, color=ROLES_COLOR.get(rol, MUTED),
+                                          line=dict(width=0.5, color=CARD_BG)))
+        fig2.update_xaxes(title="Demanda diaria (unidades)", gridcolor=CARD_BORDER)
+        fig2.update_yaxes(title="Variabilidad del tiempo (CV)", gridcolor=CARD_BORDER)
+        fig2.update_layout(legend=dict(font=dict(color=TEXT, size=10)))
+        st.plotly_chart(fig_layout(fig2, "Mapa de productos: volumen vs. variabilidad", height=320),
+                         use_container_width=True)
 
     test_dem = prueba_estadistica_clusters(clusters["demanda"], clusters["cluster"])
     test_cv = prueba_estadistica_clusters(clusters["cv_tiempo"], clusters["cluster"])
-    st.markdown(
-        f"**Prueba de Kruskal-Wallis** — ¿los grupos son estadísticamente distintos?  \n"
-        f"Demanda: H={test_dem['estadistico_H']:.2f}, p={test_dem['valor_p']:.2e} "
-        f"({'✅ significativo' if test_dem['significativo_al_5pct'] else '❌ no significativo'})  \n"
-        f"Variabilidad: H={test_cv['estadistico_H']:.2f}, p={test_cv['valor_p']:.2e} "
-        f"({'✅ significativo' if test_cv['significativo_al_5pct'] else '❌ no significativo'})"
-    )
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        st.markdown(f"**Kruskal-Wallis — Demanda:** H={test_dem['estadistico_H']:.2f}, p={test_dem['valor_p']:.2e}")
+        badge("Significativo" if test_dem["significativo_al_5pct"] else "No significativo",
+              "ok" if test_dem["significativo_al_5pct"] else "bad")
+    with cc2:
+        st.markdown(f"**Kruskal-Wallis — Variabilidad:** H={test_cv['estadistico_H']:.2f}, p={test_cv['valor_p']:.2e}")
+        badge("Significativo" if test_cv["significativo_al_5pct"] else "No significativo",
+              "ok" if test_cv["significativo_al_5pct"] else "bad")
 
     with st.expander("Ver tabla completa de clusters de productos"):
-        st.dataframe(clusters.sort_values("demanda", ascending=False))
+        st.dataframe(clusters.sort_values("demanda", ascending=False), use_container_width=True)
 
 with tab_maq:
     st.write(
@@ -177,19 +331,23 @@ with tab_maq:
 
     c5, c6 = st.columns(2)
     with c5:
-        fig_em, ax_em = plt.subplots(figsize=(5, 3.5))
-        ax_em.plot(tabla_k_maq["k"], tabla_k_maq["inercia"], marker="o")
-        ax_em.set_xlabel("k (número de grupos)")
-        ax_em.set_ylabel("Inercia")
-        ax_em.set_title("Método del codo — máquinas")
-        st.pyplot(fig_em)
+        fig_em = go.Figure()
+        fig_em.add_scatter(x=tabla_k_maq["k"], y=tabla_k_maq["inercia"], mode="lines+markers",
+                            line=dict(color=ACCENT, width=2.5), marker=dict(size=8))
+        fig_em.update_xaxes(title="k", gridcolor=CARD_BORDER)
+        fig_em.update_yaxes(title="Inercia", gridcolor=CARD_BORDER)
+        st.plotly_chart(fig_layout(fig_em, "Método del codo — máquinas", height=300), use_container_width=True)
     with c6:
-        fig_sm, ax_sm = plt.subplots(figsize=(5, 3.5))
-        ax_sm.plot(tabla_k_maq["k"], tabla_k_maq["silhouette"], marker="o", color="#2E7D32")
-        ax_sm.set_xlabel("k (número de grupos)")
-        ax_sm.set_ylabel("Silhouette Score")
-        ax_sm.set_title("Validación por Silhouette — máquinas")
-        st.pyplot(fig_sm)
+        mejor_k_m = int(tabla_k_maq.loc[tabla_k_maq["silhouette"].idxmax(), "k"])
+        fig_sm = go.Figure()
+        fig_sm.add_scatter(x=tabla_k_maq["k"], y=tabla_k_maq["silhouette"], mode="lines+markers",
+                            line=dict(color=TEAL, width=2.5), marker=dict(size=8))
+        fig_sm.add_scatter(x=[mejor_k_m], y=[tabla_k_maq["silhouette"].max()], mode="markers",
+                            marker=dict(size=14, color=DANGER))
+        fig_sm.update_xaxes(title="k", gridcolor=CARD_BORDER)
+        fig_sm.update_yaxes(title="Silhouette Score", gridcolor=CARD_BORDER)
+        fig_sm.update_layout(showlegend=False)
+        st.plotly_chart(fig_layout(fig_sm, "Validación por Silhouette — máquinas", height=300), use_container_width=True)
 
     n_clusters_maq = st.slider("Número de grupos de máquinas", 2, 5, 3)
     clusters_maq = clusterizar_maquinas(cij, setup, n_clusters=n_clusters_maq)
@@ -200,17 +358,17 @@ with tab_maq:
     )
 
     test_setup = prueba_estadistica_clusters(clusters_maq["setup_promedio"], clusters_maq["cluster"])
-    st.markdown(
-        f"**Prueba de Kruskal-Wallis (SetUp)**: H={test_setup['estadistico_H']:.2f}, "
-        f"p={test_setup['valor_p']:.3f} "
-        f"({'✅ significativo' if test_setup['significativo_al_5pct'] else '❌ no significativo'})"
-    )
+    st.markdown(f"**Kruskal-Wallis (SetUp):** H={test_setup['estadistico_H']:.2f}, p={test_setup['valor_p']:.3f}")
+    badge("Significativo" if test_setup["significativo_al_5pct"] else "No significativo",
+          "ok" if test_setup["significativo_al_5pct"] else "bad")
     if not test_setup["significativo_al_5pct"]:
         st.caption(
             "Con solo 10 máquinas, la prueba tiene poca potencia estadística — "
             "no alcanzar significancia no invalida la agrupación, pero sí debe "
             "declararse como limitación en la tesis (sección de Limitaciones, Fase 7)."
         )
+
+st.divider()
 
 # --------------------------------------------------------------------
 # Sección: optimización
@@ -230,15 +388,27 @@ if resultado is None:
     st.warning("Da clic en **Calcular plan de producción** en la barra lateral para resolver el modelo.")
     st.stop()
 
-st.success(
-    f"Estado del solver: **{resultado['estado']}** "
-    f"({'GAP = 0 %, óptimo certificado' if resultado['gap_certificado'] else 'sin GAP certificado, sube el tiempo límite'})"
-    f"  |  Tiempo total (producción + setup): **{resultado['valor_objetivo']:.0f} min**"
-)
-
 asignacion = resultado["asignacion"]
 util = resultado["utilizacion_min"]
 n_setups = resultado["n_setups"]
+util_pct_max = float((util / resultado["cap_minutos"] * 100).max())
+
+# ---- Fila de tarjetas KPI ----
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+with kpi1:
+    st.metric("Estado del solver", resultado["estado"],
+              "GAP 0%" if resultado["gap_certificado"] else "sin certificar")
+with kpi2:
+    st.metric("Tiempo total", f"{resultado['valor_objetivo']:,.0f} min".replace(",", "."))
+with kpi3:
+    st.metric("Utilización máxima", f"{util_pct_max:.1f}%")
+with kpi4:
+    maquina_top = util.idxmax()
+    st.metric("Máquina más cargada", maquina_top, f"{util_pct_max:.1f}%")
+with kpi5:
+    st.metric("Total de alistamientos", int(n_setups.sum()))
+
+st.markdown("")
 
 tab_plan, tab_comp, tab_sens, tab_cuello, tab_multi = st.tabs([
     "📋 Plan y utilización",
@@ -250,20 +420,19 @@ tab_plan, tab_comp, tab_sens, tab_cuello, tab_multi = st.tabs([
 
 # ---------------- TAB 1: Plan y utilización ----------------
 with tab_plan:
-    fig3, ax3 = plt.subplots(figsize=(8, 4))
-    ax3.bar(util.index, util.values, color="#4C72B0", label="Usado")
-    ax3.axhline(resultado["cap_minutos"], color="red", linestyle="--", label="Capacidad (1440 min)")
-    ax3.set_ylabel("Minutos usados en el día")
-    ax3.set_title("Utilización de capacidad por máquina")
-    ax3.legend()
-    st.pyplot(fig3)
+    col_chart, col_gauge = st.columns([2.3, 1])
+    with col_chart:
+        st.plotly_chart(grafico_utilizacion(util, resultado["cap_minutos"]), use_container_width=True)
+    with col_gauge:
+        gauge_con_titulo(util_pct_max, "Utilización máxima", umbral_bueno=95, umbral_malo=80)
+        gauge_con_titulo(100 if resultado["gap_certificado"] else 0, "GAP certificado", umbral_bueno=99)
 
     resumen = pd.DataFrame({
         "Utilización (min)": util.round(1),
         "% de capacidad": (util / resultado["cap_minutos"] * 100).round(1),
         "N° de Set-ups": n_setups,
     })
-    st.dataframe(resumen)
+    st.dataframe(resumen, use_container_width=True)
 
     st.subheader("¿Cuánto producir de cada referencia y en qué máquina?")
     tabla = asignacion[asignacion.sum(axis=1) > 0].copy()
@@ -303,6 +472,16 @@ with tab_comp:
         c2.metric("Tiempo total — política empírica", f"{emp['valor_objetivo']:.0f} min")
         c3.metric("Mejora del modelo óptimo", f"{mejora:.1f} %")
 
+        fig_comp = go.Figure()
+        fig_comp.add_bar(x=["Modelo óptimo", "Política empírica"],
+                          y=[resultado["valor_objetivo"], emp["valor_objetivo"]],
+                          marker_color=[ACCENT, MUTED],
+                          text=[f"{resultado['valor_objetivo']:,.0f} min", f"{emp['valor_objetivo']:,.0f} min"],
+                          textposition="outside", textfont=dict(color=TEXT))
+        fig_comp.update_yaxes(title="Tiempo total (min)", gridcolor=CARD_BORDER)
+        st.plotly_chart(fig_layout(fig_comp, f"Mejora del modelo óptimo: {mejora:.1f}%", height=380),
+                         use_container_width=True)
+
         if len(emp["demanda_incumplida"]) > 0:
             st.warning("La política empírica NO alcanza a cumplir toda la demanda en estas referencias:")
             st.dataframe(emp["demanda_incumplida"])
@@ -322,12 +501,23 @@ with tab_sens:
                                           tiempo_limite_seg=tiempo_limite)
         st.dataframe(sens, use_container_width=True)
 
-        fig4, ax4 = plt.subplots(figsize=(7, 4))
-        ax4.plot(sens["factor_demanda"], sens["valor_objetivo_min"], marker="o", color="#1B3A6B")
-        ax4.set_xlabel("Factor de demanda (1.0 = demanda real)")
-        ax4.set_ylabel("Tiempo total del sistema (min)")
-        ax4.set_title("Sensibilidad del tiempo total a la demanda")
-        st.pyplot(fig4)
+        fig4 = go.Figure()
+        fig4.add_scatter(x=sens["factor_demanda"], y=sens["valor_objetivo_min"], mode="lines+markers",
+                          name="Tiempo total", line=dict(color=ACCENT, width=2.5), marker=dict(size=8),
+                          yaxis="y1")
+        fig4.add_scatter(x=sens["factor_demanda"], y=sens["utilizacion_maxima_pct"], mode="lines+markers",
+                          name="Utilización máxima (%)", line=dict(color=DANGER, width=2, dash="dash"),
+                          marker=dict(size=8, symbol="square"), yaxis="y2")
+        fig4.update_layout(
+            xaxis=dict(title="Factor de demanda (1.0 = demanda real)", gridcolor=CARD_BORDER),
+            yaxis=dict(title="Tiempo total (min)", gridcolor=CARD_BORDER, titlefont=dict(color=ACCENT)),
+            yaxis2=dict(title="Utilización máxima (%)", overlaying="y", side="right", showgrid=False,
+                        titlefont=dict(color=DANGER)),
+            legend=dict(font=dict(color=TEXT, size=11), orientation="h", yanchor="bottom", y=1.02, x=0),
+        )
+        st.plotly_chart(fig_layout(fig4, "Sensibilidad del sistema a la demanda", height=440,
+                                    margin=dict(l=50, r=50, t=95, b=40)),
+                         use_container_width=True)
 
 # ---------------- TAB 4: Cuello de botella ----------------
 with tab_cuello:
@@ -348,6 +538,27 @@ with tab_cuello:
             cuello = analisis_cuello_de_botella(cij, demanda, setup,
                                                  cap_minutos=resultado["cap_minutos"],
                                                  tiempo_limite_seg=tiempo_limite)
+        cuello_ordenado = cuello.dropna(subset=["mejora_min_por_+30min_capacidad"]).sort_values(
+            "mejora_min_por_+30min_capacidad")
+        excluidas = cuello[cuello["mejora_min_por_+30min_capacidad"].isna()]
+        if len(excluidas) > 0:
+            st.warning(
+                f"⚠️ {len(excluidas)} máquina(s) no alcanzaron GAP=0% certificado dentro del "
+                f"tiempo límite del solver ({tiempo_limite}s) y se excluyeron del gráfico para no "
+                f"mostrar un valor engañoso: {', '.join(excluidas['maquina'].tolist())}. "
+                f"Sube el tiempo máximo de cómputo en la barra lateral para incluirlas."
+            )
+        fig_c = go.Figure()
+        colores_c = [DANGER if v == cuello_ordenado["mejora_min_por_+30min_capacidad"].max() else ACCENT
+                     for v in cuello_ordenado["mejora_min_por_+30min_capacidad"]]
+        fig_c.add_bar(y=cuello_ordenado["maquina"], x=cuello_ordenado["mejora_min_por_+30min_capacidad"],
+                      orientation="h", marker_color=colores_c,
+                      text=[f"{v:.2f} min" for v in cuello_ordenado["mejora_min_por_+30min_capacidad"]],
+                      textposition="outside", textfont=dict(color=TEXT))
+        fig_c.update_xaxes(title="Mejora en el tiempo total (min) por +30 min de capacidad", gridcolor=CARD_BORDER)
+        st.plotly_chart(fig_layout(fig_c, "¿Cuál máquina es el cuello de botella real?", height=420),
+                         use_container_width=True)
+
         st.dataframe(cuello, use_container_width=True)
         top = cuello.iloc[0]
         st.success(f"**{top['maquina']}** es el cuello de botella real del sistema: "
@@ -365,16 +576,18 @@ with tab_multi:
         "demanda real."
     )
 
-    dias_habiles_input = st.number_input(
-        "Días hábiles usados para estimar la demanda (a partir de ventas del semestre)",
-        min_value=60, max_value=300, value=180, step=10,
-    )
-    dias_horizonte = st.slider("Días del horizonte de planeación", 2, 7, 3)
-    tiempo_limite_multi = st.slider(
-        "Tiempo máximo de cómputo del solver multi-día (seg)", 30, 300, 120,
-        help="El modelo multi-día es más grande (200 referencias x 10 máquinas x N días); "
-             "puede tardar más que el modelo diario.",
-    )
+    cma, cmb, cmc = st.columns(3)
+    with cma:
+        dias_habiles_input = st.number_input(
+            "Días hábiles usados para estimar la demanda", min_value=60, max_value=300, value=180, step=10,
+        )
+    with cmb:
+        dias_horizonte = st.slider("Días del horizonte de planeación", 2, 7, 3)
+    with cmc:
+        tiempo_limite_multi = st.slider(
+            "Tiempo máx. del solver multi-día (seg)", 30, 300, 120,
+            help="El modelo multi-día es más grande (200 refs x 10 máquinas x N días); puede tardar más.",
+        )
 
     if st.button("🗓️ Calcular plan multi-día", type="primary"):
         with st.spinner("Cargando el catálogo completo (200 referencias)..."):
@@ -407,28 +620,31 @@ with tab_multi:
         st.warning("Da clic en **Calcular plan multi-día** para resolver el modelo.")
     else:
         estado_txt = res_multi["estado"]
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Estado del solver", estado_txt)
+        with m2:
+            st.metric("Tiempo total (horizonte)", f"{res_multi['valor_objetivo']:,.0f} min".replace(",", "."))
+        with m3:
+            st.metric("Horizonte", f"{res_multi['dias']} días")
+        with m4:
+            refs_cubiertas = res_multi["plan"]["producto"].nunique() if len(res_multi["plan"]) else 0
+            st.metric("Referencias cubiertas", refs_cubiertas)
+
         if estado_txt == "Optimal":
-            st.success(
-                f"Estado del solver: **{estado_txt}** (GAP = 0 %, óptimo certificado) — "
-                f"las 200 referencias caben en el horizonte de {res_multi['dias']} días. "
-                f"Tiempo total: **{res_multi['valor_objetivo']:.0f} min**."
-            )
+            st.markdown("")
+            badge("GAP = 0 % — óptimo certificado, catálogo completo cubierto", "ok")
         elif estado_txt == "Infeasible":
-            st.error(
-                f"Estado del solver: **{estado_txt}** — con {res_multi['dias']} días el "
-                f"catálogo completo no alcanza a caber. Prueba a aumentar el horizonte "
-                f"(por ejemplo, a 4 o 5 días)."
-            )
+            badge(f"Infactible con {res_multi['dias']} días — prueba a aumentar el horizonte", "bad")
         else:
-            st.warning(f"Estado del solver: **{estado_txt}** — sube el tiempo límite del solver.")
+            badge("Sin GAP certificado — sube el tiempo límite del solver", "warn")
 
         if len(res_multi["plan"]) > 0:
-            st.subheader("Utilización por día y máquina (%)")
+            st.markdown("")
             util_pct = (res_multi["utilizacion_dia_maquina"] / res_multi["cap_minutos"] * 100).round(1)
-            st.dataframe(
-                util_pct.style.background_gradient(cmap="RdYlGn_r", vmin=0, vmax=100).format("{:.1f}%"),
-                use_container_width=True,
-            )
+            st.plotly_chart(heatmap_utilizacion(util_pct, "Utilización por día y máquina (%)"),
+                             use_container_width=True)
 
             st.subheader("Alistamientos (setups) por día y máquina")
             st.dataframe(res_multi["setups_dia_maquina"], use_container_width=True)
