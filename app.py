@@ -1,669 +1,890 @@
 # -*- coding: utf-8 -*-
 """
-app.py — Planeador de Producción RPM Colombia (dashboard profesional)
+app.py - Planeador de Producción RPM Colombia
 
-Cómo correrlo:
-    pip install streamlit pandas openpyxl scikit-learn pulp plotly
+Ejecución:
+    pip install -r requirements.txt
     streamlit run app.py
 """
 
+from __future__ import annotations
+
 import io
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 from rpm_core import (
     CAP_MINUTOS_DIA,
     MACHINES,
     analisis_cuello_de_botella,
     analisis_sensibilidad,
+    analisis_sensibilidad_imputacion,
     calibrar_demanda_extendida,
     cargar_datos,
     cargar_datos_extendido,
     clusterizar_maquinas,
     clusterizar_productos,
+    comparar_matriz_publicada_reconstruida,
+    concordancia_kmeans_ward_maquinas,
+    construir_cij_con_imputacion,
+    demanda_entera,
     elbow_silhouette,
+    metricas_concentracion_demanda,
+    monte_carlo_demanda,
     politica_empirica,
     prueba_estadistica_clusters,
     resolver_asignacion,
     resolver_multidia,
+    soporte_observado_solucion,
+    validacion_imputacion_repetida,
 )
 
-st.set_page_config(page_title="RPM Colombia — Planeador de Producción", layout="wide",
-                    page_icon="🏭", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="RPM Colombia | Planeador de producción",
+    page_icon="🏭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ==========================================================================
-# PALETA Y ESTILO
-# ==========================================================================
-BG = "#0E1117"
-CARD_BG = "#161B26"
-CARD_BORDER = "#232938"
-TEXT = "#E6E8EC"
-MUTED = "#8A94A6"
-ACCENT = "#3DA5D9"
-TEAL = "#33C2A3"
-SUCCESS = "#2ECC71"
-WARNING = "#F5A623"
-DANGER = "#E9576B"
-NAVY = "#223B5E"
+# ---------------------------------------------------------------------------
+# Identidad visual: técnica, sobria y con contraste accesible
+# ---------------------------------------------------------------------------
+BG = "#0B1220"
+CARD = "#111827"
+CARD_2 = "#172033"
+GRID = "#2A364B"
+TEXT = "#E5E7EB"
+MUTED = "#94A3B8"
+BLUE = "#5F7D9D"
+TEAL = "#4D8B82"
+AMBER = "#B49A5A"
+RED = "#A65F64"
+SLATE = "#718096"
+LIGHT = "#CBD5E1"
+GREEN = "#688F78"
 
-PLOTLY_TEMPLATE = "plotly_dark"
-FONT = dict(family="Segoe UI, -apple-system, sans-serif", color=TEXT)
-
-st.markdown(f"""
-<style>
-    .block-container {{ padding-top: 1.4rem; }}
-    div[data-testid="stMetric"] {{
-        background: {CARD_BG};
-        border: 1px solid {CARD_BORDER};
-        border-radius: 10px;
-        padding: 14px 16px 10px 16px;
-    }}
-    div[data-testid="stMetricLabel"] {{ color: {MUTED} !important; font-size: 0.85rem; }}
-    .kpi-title {{
-        font-size: 0.95rem; color: {MUTED}; text-transform: uppercase;
-        letter-spacing: 0.04em; margin-bottom: 2px;
-    }}
-    .section-card {{
-        background: {CARD_BG}; border: 1px solid {CARD_BORDER};
-        border-radius: 12px; padding: 18px 20px; margin-bottom: 14px;
-    }}
-    .badge-ok {{ background: rgba(46,204,113,0.15); color: {SUCCESS};
-                 padding: 3px 10px; border-radius: 20px; font-weight: 600; font-size: 0.85rem; }}
-    .badge-warn {{ background: rgba(245,166,35,0.15); color: {WARNING};
-                   padding: 3px 10px; border-radius: 20px; font-weight: 600; font-size: 0.85rem; }}
-    .badge-bad {{ background: rgba(233,87,107,0.15); color: {DANGER};
-                  padding: 3px 10px; border-radius: 20px; font-weight: 600; font-size: 0.85rem; }}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🏭 Planeador de Producción — RPM Colombia")
-st.caption(
-    "Prototipo de apoyo a la decisión: a partir de los tiempos históricos por máquina y "
-    "la demanda del día, recomienda cuánto producir en cada máquina y agrupa los "
-    "productos por su rol óptimo en planta."
+st.markdown(
+    f"""
+    <style>
+      .stApp {{ background: {BG}; }}
+      .block-container {{ padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1500px; }}
+      h1, h2, h3 {{ letter-spacing: -0.015em; }}
+      h1 {{ font-weight: 650 !important; }}
+      div[data-testid="stMetric"] {{
+          background: linear-gradient(180deg, {CARD_2} 0%, {CARD} 100%);
+          border: 1px solid {GRID}; border-radius: 12px;
+          padding: 14px 16px 12px 16px;
+      }}
+      div[data-testid="stMetricLabel"] {{ color: {MUTED} !important; }}
+      div[data-testid="stMetricValue"] {{ color: {TEXT} !important; }}
+      div[data-baseweb="tab-list"] {{ gap: 8px; }}
+      button[data-baseweb="tab"] {{
+          background: {CARD}; border: 1px solid {GRID}; border-radius: 8px;
+          padding-left: 14px; padding-right: 14px;
+      }}
+      .technical-note {{
+          background: {CARD}; border-left: 3px solid {BLUE};
+          padding: 12px 14px; border-radius: 4px; color: {LIGHT};
+          margin: 8px 0 14px 0;
+      }}
+      .badge {{ display:inline-block; padding:4px 10px; border-radius:999px;
+                font-size:0.82rem; font-weight:600; margin-right:6px; }}
+      .ok {{ background:rgba(91,154,117,.17); color:#9ED0AD; border:1px solid rgba(91,154,117,.4); }}
+      .warn {{ background:rgba(212,167,44,.15); color:#E7C96B; border:1px solid rgba(212,167,44,.4); }}
+      .bad {{ background:rgba(201,93,99,.15); color:#E8A3A7; border:1px solid rgba(201,93,99,.4); }}
+      .muted {{ color:{MUTED}; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
-# ==========================================================================
-# Helpers de gráficos Plotly
-# ==========================================================================
-def fig_layout(fig, title=None, height=380, **kw):
-    margen = kw.pop("margin", dict(l=40, r=20, t=50 if title else 20, b=40))
-    layout_kwargs = dict(
-        template=PLOTLY_TEMPLATE, paper_bgcolor=CARD_BG, plot_bgcolor=CARD_BG,
-        font=FONT, height=height, margin=margen,
+def fmt_num(x, dec=0):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "N/D"
+    s = f"{x:,.{dec}f}"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def badge(texto: str, tipo: str = "ok"):
+    st.markdown(f'<span class="badge {tipo}">{texto}</span>', unsafe_allow_html=True)
+
+
+def fig_layout(fig, title=None, height=390, legend=True, **kwargs):
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=CARD,
+        plot_bgcolor=CARD,
+        font=dict(family="Inter, Segoe UI, sans-serif", color=TEXT, size=12),
+        height=height,
+        margin=kwargs.pop("margin", dict(l=45, r=25, t=58 if title else 25, b=45)),
+        showlegend=legend,
+        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color=LIGHT)),
+        hoverlabel=dict(bgcolor="#0F172A", font_color=TEXT),
+        **kwargs,
     )
     if title:
-        # Solo se incluye la clave "title" cuando hay texto real. Pasar
-        # title=None explícitamente a update_layout() activa un bug de la
-        # versión de Plotly.js empaquetada con Streamlit que muestra el
-        # texto literal "undefined" en los gráficos tipo Indicator.
-        layout_kwargs["title"] = dict(text=title, font=dict(size=15, color=TEXT))
-    layout_kwargs.update(kw)
-    fig.update_layout(**layout_kwargs)
+        fig.update_layout(title=dict(text=title, x=0.01, xanchor="left", font=dict(size=16, color=TEXT)))
+    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID)
+    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID)
     return fig
 
 
-def grafico_utilizacion(util, cap, cuello_top=None):
-    colores = [DANGER if v >= cap * 0.98 else (WARNING if v >= cap * 0.85 else ACCENT) for v in util.values]
-    if cuello_top:
-        colores = [WARNING if m == cuello_top else c for m, c in zip(util.index, colores)]
-    fig = go.Figure()
-    fig.add_bar(x=util.index, y=util.values, marker_color=colores,
-                text=[f"{v:,.0f}" for v in util.values], textposition="outside",
-                textfont=dict(color=TEXT, size=11))
-    fig.add_hline(y=cap, line_dash="dash", line_color=DANGER,
-                   annotation_text=f"Capacidad ({cap:,.0f} min)", annotation_font_color=DANGER)
-    fig.update_yaxes(title="Minutos utilizados", gridcolor=CARD_BORDER, range=[0, cap * 1.18])
-    fig.update_xaxes(title="Máquina")
-    return fig_layout(fig, "Utilización de capacidad por máquina")
-
-
-def gauge(valor, titulo, sufijo="%", rango=(0, 100), umbral_bueno=90, umbral_malo=70, invertido=False):
-    if invertido:
-        color = SUCCESS if valor <= (100 - umbral_bueno) else (WARNING if valor <= (100 - umbral_malo) else DANGER)
-    else:
-        color = SUCCESS if valor >= umbral_bueno else (WARNING if valor >= umbral_malo else DANGER)
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=valor,
-        number={"suffix": sufijo, "font": {"size": 30, "color": TEXT}},
-        gauge={
-            "axis": {"range": rango, "tickcolor": MUTED, "tickfont": {"color": MUTED, "size": 9}},
-            "bar": {"color": color, "thickness": 0.75},
-            "bgcolor": CARD_BORDER,
-            "borderwidth": 0,
-        },
-    ))
-    # Nota: el título NO se pasa dentro del Indicator porque una versión de
-    # Plotly.js empaquetada con Streamlit tiene un bug conocido que muestra
-    # el texto literal "undefined" junto al título cuando se usa la
-    # propiedad "title" de un Indicator tipo gauge. En su lugar, el título
-    # se dibuja como texto de Streamlit justo encima del gráfico (ver
-    # función gauge_con_titulo).
-    return fig_layout(fig, height=170, margin=dict(l=20, r=20, t=10, b=10))
-
-
-def gauge_con_titulo(valor, titulo, **kwargs):
-    st.markdown(
-        f'<p style="color:{MUTED};font-size:13px;margin:6px 0 -6px 4px;'
-        f'text-transform:uppercase;letter-spacing:0.03em">{titulo}</p>',
-        unsafe_allow_html=True,
-    )
-    st.plotly_chart(gauge(valor, titulo, **kwargs), use_container_width=True)
-
-
-def donut(labels, values, colores, titulo=None):
-    fig = go.Figure(go.Pie(
-        labels=labels, values=values, hole=0.58, marker=dict(colors=colores, line=dict(color=CARD_BG, width=2)),
-        textinfo="percent", textfont=dict(color=TEXT, size=12),
-    ))
-    fig.update_layout(showlegend=True, legend=dict(font=dict(color=TEXT, size=11), orientation="v"))
-    return fig_layout(fig, titulo, height=320)
-
-
-def heatmap_utilizacion(tabla_pct, titulo):
-    fig = go.Figure(go.Heatmap(
-        z=tabla_pct.values, x=tabla_pct.columns.tolist(), y=[f"Día {d}" for d in tabla_pct.index],
-        colorscale=[[0, "#1F6E5C"], [0.7, "#F5A623"], [1, "#E9576B"]],
-        zmin=0, zmax=100, text=tabla_pct.values.round(1), texttemplate="%{text}%",
-        textfont=dict(size=10, color=TEXT), colorbar=dict(title="%", tickfont=dict(color=TEXT)),
-    ))
-    fig.update_xaxes(title="Máquina", side="top")
-    fig.update_yaxes(title="", autorange="reversed")
-    return fig_layout(fig, titulo, height=120 + 45 * len(tabla_pct))
-
-
-def badge(texto, tipo="ok"):
-    clase = {"ok": "badge-ok", "warn": "badge-warn", "bad": "badge-bad"}[tipo]
-    st.markdown(f'<span class="{clase}">{texto}</span>', unsafe_allow_html=True)
-
-
-# ==========================================================================
-# Barra lateral — datos y parámetros
-# ==========================================================================
-st.sidebar.header("1. Datos de entrada")
-
-archivo = st.sidebar.file_uploader(
-    "Sube el Excel de datos (mismo formato del Anexo A)", type=["xlsx"]
-)
-usar_ejemplo = st.sidebar.checkbox("Usar el Excel de ejemplo del proyecto", value=(archivo is None))
-
-st.sidebar.header("2. Parámetros del modelo")
-cap_min = st.sidebar.number_input(
-    "Capacidad diaria por máquina (min)", min_value=60, max_value=2880, value=CAP_MINUTOS_DIA, step=60
-)
-n_clusters = st.sidebar.slider("Número de grupos (clustering de productos)", 2, 5, 3)
-tiempo_limite = st.sidebar.slider("Tiempo máximo de cómputo del solver (seg)", 10, 180, 60)
-
-correr = st.sidebar.button("🚀 Calcular plan de producción", type="primary", use_container_width=True)
-
-
 @st.cache_data(show_spinner=False)
-def _cargar(path_o_buffer):
-    return cargar_datos(path_o_buffer)
+def cargar_referencia_monte_carlo():
+    """Carga el resultado N=1000 documentado en la tesis sin recalcularlo."""
+    path = Path(__file__).resolve().parent / "results" / "monte_carlo_reference.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
-# --------------------------------------------------------------------
-# Cargar datos
-# --------------------------------------------------------------------
-datos = None
+@st.cache_data(show_spinner=False, ttl=24 * 60 * 60)
+def ejecutar_monte_carlo_cache(cij, demanda, setup, n_escenarios, seed, low, high, cap_minutos, tiempo_limite_seg):
+    """Evita repetir una corrida pesada con exactamente los mismos parametros."""
+    return monte_carlo_demanda(
+        cij, demanda, setup, n_escenarios=int(n_escenarios), seed=int(seed),
+        low=float(low), high=float(high), cap_minutos=cap_minutos,
+        tiempo_limite_seg=int(tiempo_limite_seg),
+    )
+
+
+def grafico_pareto_demanda(demanda: pd.Series):
+    d = demanda.sort_values(ascending=False)
+    cum = d.cumsum() / d.sum() * 100
+    x = np.arange(1, len(d) + 1)
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(x=x, y=d.values, marker_color=BLUE, name="Demanda"), secondary_y=False)
+    fig.add_trace(go.Scatter(x=x, y=cum.values, mode="lines", line=dict(color=TEAL, width=2.6),
+                             name="Acumulado"), secondary_y=True)
+    fig.add_hline(y=80, line_dash="dot", line_color=AMBER, secondary_y=True)
+    fig.update_xaxes(title="Referencias ordenadas por demanda")
+    fig.update_yaxes(title="Unidades/día", secondary_y=False)
+    fig.update_yaxes(title="Demanda acumulada (%)", range=[0, 105], secondary_y=True)
+    return fig_layout(fig, "Concentración de la demanda: análisis de Pareto", height=390)
+
+
+def grafico_cobertura_maquina(mask_observado: pd.DataFrame):
+    pct = mask_observado.mean(axis=0) * 100
+    overall = mask_observado.to_numpy().mean() * 100
+    fig = go.Figure()
+    fig.add_bar(x=pct.index, y=pct.values, marker_color=BLUE,
+                text=[f"{v:.1f}%" for v in pct.values], textposition="outside")
+    fig.add_hline(y=overall, line_dash="dash", line_color=TEAL,
+                  annotation_text=f"Cobertura global {overall:.1f}%", annotation_font_color=TEAL)
+    fig.update_yaxes(title="Celdas observadas (%)", range=[0, 110])
+    fig.update_xaxes(title="Máquina")
+    return fig_layout(fig, "Cobertura empírica de Cij por máquina", height=360, legend=False)
+
+
+def grafico_utilizacion(util: pd.Series, caps: pd.Series):
+    pct = util / caps * 100
+    orden = pct.sort_values().index
+    colors = [RED if pct[m] >= 98 else (AMBER if pct[m] >= 90 else BLUE) for m in orden]
+    fig = go.Figure(go.Bar(
+        y=orden, x=pct.loc[orden], orientation="h", marker_color=colors,
+        text=[f"{pct[m]:.1f}%" for m in orden], textposition="outside",
+    ))
+    fig.add_vline(x=100, line_dash="dash", line_color=RED)
+    fig.update_xaxes(title="Utilización de capacidad (%)", range=[0, 108])
+    fig.update_yaxes(title="")
+    return fig_layout(fig, "Utilización por máquina", height=430, legend=False)
+
+
+def grafico_descomposicion(resultado: dict):
+    prod = resultado["tiempo_produccion_min"]
+    setup_t = resultado["tiempo_setup_min"]
+    slack = resultado["holgura_min"].clip(lower=0)
+    fig = go.Figure()
+    fig.add_bar(x=MACHINES, y=prod[MACHINES], name="Producción", marker_color=BLUE)
+    fig.add_bar(x=MACHINES, y=setup_t[MACHINES], name="Alistamientos", marker_color=AMBER)
+    fig.add_bar(x=MACHINES, y=slack[MACHINES], name="Holgura", marker_color=SLATE)
+    fig.update_layout(barmode="stack")
+    fig.update_yaxes(title="Minutos por día")
+    fig.update_xaxes(title="Máquina")
+    return fig_layout(fig, "Composición de la capacidad: producción, setup y holgura", height=430)
+
+
+def heatmap_utilizacion(tabla_pct: pd.DataFrame, titulo: str):
+    colorscale = [[0.0, "#223047"], [0.60, BLUE], [0.90, AMBER], [1.0, RED]]
+    fig = go.Figure(go.Heatmap(
+        z=tabla_pct.values,
+        x=tabla_pct.columns.tolist(),
+        y=[f"Día {d}" for d in tabla_pct.index],
+        zmin=0, zmax=100,
+        colorscale=colorscale,
+        text=tabla_pct.round(1).values,
+        texttemplate="%{text}%",
+        colorbar=dict(title="%"),
+    ))
+    fig.update_yaxes(autorange="reversed")
+    return fig_layout(fig, titulo, height=max(280, 120 + 46 * len(tabla_pct)), legend=False)
+
+
+def long_plan(asignacion: pd.DataFrame):
+    plan = asignacion.stack().reset_index()
+    plan.columns = ["producto", "maquina", "unidades"]
+    plan = plan[plan["unidades"] > 0].copy()
+    return plan.sort_values(["maquina", "unidades"], ascending=[True, False])
+
+
+# ---------------------------------------------------------------------------
+# Cabecera
+# ---------------------------------------------------------------------------
+st.title("Planeador de producción | RPM Colombia")
+st.caption(
+    "Herramienta de apoyo a la decisión basada en programación lineal entera mixta. "
+    "La aplicación separa datos, diagnóstico, optimización y análisis de estabilidad para "
+    "que cada resultado pueda ser trazado y defendido técnicamente."
+)
+
+# ---------------------------------------------------------------------------
+# Barra lateral
+# ---------------------------------------------------------------------------
+st.sidebar.header("Datos")
+archivo = st.sidebar.file_uploader("Excel del proyecto", type=["xlsx"])
+usar_ejemplo = st.sidebar.checkbox("Usar AnexodeDatosxlsx.xlsx", value=archivo is None)
+
+st.sidebar.header("Optimización")
+cap_min = st.sidebar.number_input("Capacidad diaria por máquina (min)", 60, 2880, CAP_MINUTOS_DIA, 60)
+tiempo_limite = st.sidebar.slider("Tiempo máximo por MILP (s)", 10, 300, 60)
+n_clusters = st.sidebar.slider("Clusters de productos", 2, 5, 3)
+
+st.sidebar.markdown("---")
+correr = st.sidebar.button("Calcular plan diario", type="primary", use_container_width=True)
+
 if archivo is not None:
-    datos = _cargar(archivo)
+    excel_bytes = archivo.getvalue()
+    def source():
+        return io.BytesIO(excel_bytes)
 elif usar_ejemplo:
-    datos = _cargar("AnexodeDatosxlsx.xlsx")
-
-if datos is None:
-    st.info("Sube un archivo Excel o marca la casilla para usar el ejemplo del proyecto.")
+    def source():
+        return "AnexodeDatosxlsx.xlsx"
+else:
+    st.info("Sube el Excel o activa el archivo de ejemplo.")
     st.stop()
 
-cij, demanda, setup = datos["cij"], datos["demanda"], datos["setup"]
+try:
+    datos = cargar_datos(source())
+    cij_publicada, demanda, setup = datos["cij"], datos["demanda"], datos["setup"]
+    audit = construir_cij_con_imputacion(source(), productos=cij_publicada.index)
+    comp_matriz = comparar_matriz_publicada_reconstruida(cij_publicada, audit)
+except Exception as exc:
+    st.error(f"No fue posible cargar el archivo con la estructura esperada: {exc}")
+    st.stop()
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Referencias cargadas", len(cij))
-col2.metric("Máquinas", len(MACHINES))
-col3.metric("Demanda total del día (unid.)", f"{int(demanda.sum()):,}".replace(",", "."))
+modo_cij = st.sidebar.radio(
+    "Fuente de tiempos Cij",
+    ["Matriz publicada (reproduce tesis)", "Reconstruida desde registros crudos"],
+    index=0,
+    help=(
+        "La matriz publicada reproduce Z*=11.547,41. La reconstruida calcula promedios observados y "
+        "completa faltantes con la media por máquina; se ofrece como ruta de auditoría, no como sustitución silenciosa."
+    ),
+)
+if modo_cij.startswith("Matriz publicada"):
+    cij = cij_publicada.copy()
+    st.sidebar.caption("Modo reproducibilidad: usa la matriz de MODELO PL asociada al resultado principal de la tesis.")
+else:
+    cij = audit["cij"].reindex(index=cij_publicada.index, columns=MACHINES).copy()
+    st.sidebar.caption("Modo auditoría: reconstruye Cij desde las hojas crudas e imputa faltantes por media de máquina.")
 
-st.divider()
+conc = metricas_concentracion_demanda(demanda)
 
-# --------------------------------------------------------------------
-# Sección: clustering de productos y máquinas (validado)
-# --------------------------------------------------------------------
-st.header("📊 Clustering validado (productos y máquinas)")
+# KPIs de entrada
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Referencias", len(cij))
+k2.metric("Máquinas", len(MACHINES))
+k3.metric("Demanda diaria", f"{fmt_num(demanda.sum(), 0)} unid.")
+k4.metric("Cobertura observada de Cij", f"{audit['R_C']*100:.1f}%", f"{audit['n_imputadas']} celdas imputadas")
+k5.metric("Fuente Cij", "Publicada" if modo_cij.startswith("Matriz publicada") else "Reconstruida")
 
-tab_prod, tab_maq = st.tabs(["Productos", "Máquinas"])
-
-with tab_prod:
-    st.write(
-        "Cada producto se clasifica según **su volumen de demanda** y "
-        "**qué tanto varía su tiempo de producción entre máquinas**. Esto "
-        "formaliza con datos la propuesta de la tesis de separar máquinas "
-        "'de producción continua' de máquinas 'comodín' (sección 7.4.3)."
-    )
-
-    cv = cij.std(axis=1) / cij.mean(axis=1)
-    feats_prod = pd.DataFrame({"demanda": demanda, "cv_tiempo": cv})
-    tabla_k_prod = elbow_silhouette(feats_prod, k_range=range(2, 7))
+with st.expander("Calidad y trazabilidad de los datos", expanded=False):
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Celdas observadas", audit["n_observadas"])
+    q2.metric("Celdas imputadas", audit["n_imputadas"])
+    q3.metric("Referencias que acumulan 80%", conc["n80"])
+    q4.metric("Gini de demanda", f"{conc['gini']:.3f}", help="0 indica distribución uniforme; valores mayores reflejan más concentración.")
 
     c1, c2 = st.columns(2)
     with c1:
-        fig_e = go.Figure()
-        fig_e.add_scatter(x=tabla_k_prod["k"], y=tabla_k_prod["inercia"], mode="lines+markers",
-                           line=dict(color=ACCENT, width=2.5), marker=dict(size=8))
-        fig_e.update_xaxes(title="k (número de grupos)", gridcolor=CARD_BORDER)
-        fig_e.update_yaxes(title="Inercia", gridcolor=CARD_BORDER)
-        st.plotly_chart(fig_layout(fig_e, "Método del codo", height=300), use_container_width=True)
+        st.plotly_chart(grafico_cobertura_maquina(audit["mask_observado"]), use_container_width=True)
     with c2:
-        mejor_k_i = int(tabla_k_prod.loc[tabla_k_prod["silhouette"].idxmax(), "k"])
-        fig_s = go.Figure()
-        fig_s.add_scatter(x=tabla_k_prod["k"], y=tabla_k_prod["silhouette"], mode="lines+markers",
-                           line=dict(color=TEAL, width=2.5), marker=dict(size=8))
-        fig_s.add_scatter(x=[mejor_k_i], y=[tabla_k_prod["silhouette"].max()], mode="markers",
-                           marker=dict(size=14, color=DANGER), name=f"Mejor k={mejor_k_i}")
-        fig_s.update_xaxes(title="k (número de grupos)", gridcolor=CARD_BORDER)
-        fig_s.update_yaxes(title="Silhouette Score", gridcolor=CARD_BORDER)
-        fig_s.update_layout(showlegend=False)
-        st.plotly_chart(fig_layout(fig_s, "Validación por Silhouette", height=300), use_container_width=True)
+        st.plotly_chart(grafico_pareto_demanda(demanda), use_container_width=True)
 
-    mejor_k = int(tabla_k_prod.loc[tabla_k_prod["silhouette"].idxmax(), "k"])
-    st.caption(f"El mejor k según Silhouette es **{mejor_k}**. Se muestra el resultado con k={n_clusters} "
-               "(ajustable en la barra lateral) para mantener la interpretación de negocio en 3 roles.")
-
-    clusters = clusterizar_productos(cij, demanda, n_clusters=n_clusters)
-
-    ROLES_COLOR = {
-        "Producción continua (alto volumen)": TEAL,
-        "Rotación media": ACCENT,
-        "Comodín / baja escala": WARNING,
-    }
-
-    c3, c4 = st.columns([1, 2])
-    with c3:
-        conteo = clusters["rol_sugerido"].value_counts()
-        colores_d = [ROLES_COLOR.get(r, MUTED) for r in conteo.index]
-        st.plotly_chart(donut(conteo.index, conteo.values, colores_d, "Distribución por rol"),
-                         use_container_width=True)
-    with c4:
-        fig2 = go.Figure()
-        for rol, sub in clusters.groupby("rol_sugerido"):
-            fig2.add_scatter(x=sub["demanda"], y=sub["cv_tiempo"], mode="markers", name=rol,
-                              marker=dict(size=9, color=ROLES_COLOR.get(rol, MUTED),
-                                          line=dict(width=0.5, color=CARD_BG)))
-        fig2.update_xaxes(title="Demanda diaria (unidades)", gridcolor=CARD_BORDER)
-        fig2.update_yaxes(title="Variabilidad del tiempo (CV)", gridcolor=CARD_BORDER)
-        fig2.update_layout(legend=dict(font=dict(color=TEXT, size=10)))
-        st.plotly_chart(fig_layout(fig2, "Mapa de productos: volumen vs. variabilidad", height=320),
-                         use_container_width=True)
-
-    test_dem = prueba_estadistica_clusters(clusters["demanda"], clusters["cluster"])
-    test_cv = prueba_estadistica_clusters(clusters["cv_tiempo"], clusters["cluster"])
-    cc1, cc2 = st.columns(2)
-    with cc1:
-        st.markdown(f"**Kruskal-Wallis — Demanda:** H={test_dem['estadistico_H']:.2f}, p={test_dem['valor_p']:.2e}")
-        badge("Significativo" if test_dem["significativo_al_5pct"] else "No significativo",
-              "ok" if test_dem["significativo_al_5pct"] else "bad")
-    with cc2:
-        st.markdown(f"**Kruskal-Wallis — Variabilidad:** H={test_cv['estadistico_H']:.2f}, p={test_cv['valor_p']:.2e}")
-        badge("Significativo" if test_cv["significativo_al_5pct"] else "No significativo",
-              "ok" if test_cv["significativo_al_5pct"] else "bad")
-
-    with st.expander("Ver tabla completa de clusters de productos"):
-        st.dataframe(clusters.sort_values("demanda", ascending=False), use_container_width=True)
-
-with tab_maq:
+    st.markdown(
+        '<div class="technical-note"><b>Control de trazabilidad.</b> La matriz publicada en la hoja MODELO PL '
+        'reproduce el resultado principal de la tesis. La reconstrucción desde las hojas crudas permite auditar '
+        'qué celdas fueron observadas y cuáles requieren imputación. Las dos rutas se mantienen separadas para no '
+        'confundir reproducción del resultado con reconstrucción del dato.</div>',
+        unsafe_allow_html=True,
+    )
     st.write(
-        "Agrupa las 10 máquinas según su **comportamiento medido** (SetUp "
-        "promedio, tiempo de operación promedio y su varianza), en vez de "
-        "por antigüedad percibida como hace la Tabla 3 de la tesis."
+        f"Diferencia absoluta media entre la matriz publicada y la reconstrucción: "
+        f"**{comp_matriz['mae_total']:.4f} min/unidad**. En celdas observadas: "
+        f"**{comp_matriz['mae_observadas']:.4f}**; en celdas imputadas: "
+        f"**{comp_matriz['mae_imputadas']:.4f}**. Se detectan "
+        f"**{comp_matriz['n_celdas_distintas_1e6']} celdas** con diferencia superior a 10⁻⁶."
+    )
+    st.caption(
+        "La existencia de diferencias no invalida el resultado publicado: indica que reproducir la matriz de MODELO PL "
+        "y reconstruir Cij desde los registros crudos son dos ejercicios distintos. La app permite seleccionar explícitamente cuál se optimiza."
     )
 
-    tiempo_prom = cij.mean(axis=0)
-    tiempo_var = cij.var(axis=0)
-    feats_maq = pd.DataFrame({
-        "setup_promedio": setup,
-        "tiempo_operacion_promedio": tiempo_prom,
-        "varianza_tiempo": tiempo_var,
-    })
-    tabla_k_maq = elbow_silhouette(feats_maq, k_range=range(2, 6))
-
-    c5, c6 = st.columns(2)
-    with c5:
-        fig_em = go.Figure()
-        fig_em.add_scatter(x=tabla_k_maq["k"], y=tabla_k_maq["inercia"], mode="lines+markers",
-                            line=dict(color=ACCENT, width=2.5), marker=dict(size=8))
-        fig_em.update_xaxes(title="k", gridcolor=CARD_BORDER)
-        fig_em.update_yaxes(title="Inercia", gridcolor=CARD_BORDER)
-        st.plotly_chart(fig_layout(fig_em, "Método del codo — máquinas", height=300), use_container_width=True)
-    with c6:
-        mejor_k_m = int(tabla_k_maq.loc[tabla_k_maq["silhouette"].idxmax(), "k"])
-        fig_sm = go.Figure()
-        fig_sm.add_scatter(x=tabla_k_maq["k"], y=tabla_k_maq["silhouette"], mode="lines+markers",
-                            line=dict(color=TEAL, width=2.5), marker=dict(size=8))
-        fig_sm.add_scatter(x=[mejor_k_m], y=[tabla_k_maq["silhouette"].max()], mode="markers",
-                            marker=dict(size=14, color=DANGER))
-        fig_sm.update_xaxes(title="k", gridcolor=CARD_BORDER)
-        fig_sm.update_yaxes(title="Silhouette Score", gridcolor=CARD_BORDER)
-        fig_sm.update_layout(showlegend=False)
-        st.plotly_chart(fig_layout(fig_sm, "Validación por Silhouette — máquinas", height=300), use_container_width=True)
-
-    n_clusters_maq = st.slider("Número de grupos de máquinas", 2, 5, 3)
-    clusters_maq = clusterizar_maquinas(cij, setup, n_clusters=n_clusters_maq)
-    st.dataframe(
-        clusters_maq[["setup_promedio", "tiempo_operacion_promedio", "varianza_tiempo", "grupo_sugerido"]]
-        .sort_values("setup_promedio", ascending=False),
-        use_container_width=True,
-    )
-
-    test_setup = prueba_estadistica_clusters(clusters_maq["setup_promedio"], clusters_maq["cluster"])
-    st.markdown(f"**Kruskal-Wallis (SetUp):** H={test_setup['estadistico_H']:.2f}, p={test_setup['valor_p']:.3f}")
-    badge("Significativo" if test_setup["significativo_al_5pct"] else "No significativo",
-          "ok" if test_setup["significativo_al_5pct"] else "bad")
-    if not test_setup["significativo_al_5pct"]:
+    if st.button("Revalidar métodos de imputación (100 particiones)"):
+        with st.spinner("Ocultando repetidamente 20% de celdas observadas y comparando cuatro métodos..."):
+            val_imp = validacion_imputacion_repetida(source(), cij.index, n_repeticiones=100, fraccion_oculta=0.20, seed=42)
+        st.session_state["validacion_imputacion"] = val_imp
+    val_imp = st.session_state.get("validacion_imputacion")
+    if val_imp is not None:
+        resumen_imp = val_imp["resumen"].copy()
+        best = resumen_imp.iloc[0]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Mejor método repetido", best["metodo"])
+        m2.metric("MAE medio", f"{best['mae_media']:.4f} min/u")
+        m3.metric("Veces con menor MAE", f"{int(best['veces_mejor_mae'])}/100")
+        fig = go.Figure()
+        fig.add_bar(
+            x=resumen_imp["metodo"], y=resumen_imp["mae_media"], marker_color=[TEAL, BLUE, SLATE, AMBER],
+            error_y=dict(type="data", symmetric=False,
+                         array=resumen_imp["mae_ci95_high"]-resumen_imp["mae_media"],
+                         arrayminus=resumen_imp["mae_media"]-resumen_imp["mae_ci95_low"]),
+            text=[f"{v:.4f}" for v in resumen_imp["mae_media"]], textposition="outside",
+        )
+        fig.update_yaxes(title="MAE (min/unidad)")
+        st.plotly_chart(fig_layout(fig, "Revalidación repetida de la imputación", height=390, legend=False), use_container_width=True)
         st.caption(
-            "Con solo 10 máquinas, la prueba tiene poca potencia estadística — "
-            "no alcanzar significancia no invalida la agrupación, pero sí debe "
-            "declararse como limitación en la tesis (sección de Limitaciones, Fase 7)."
+            "Esta revalidación repetida es un análisis adicional. No reemplaza la tabla histórica de la tesis; "
+            "sirve para comprobar si la elección del método depende excesivamente de una única partición aleatoria."
         )
 
 st.divider()
 
-# --------------------------------------------------------------------
-# Sección: optimización
-# --------------------------------------------------------------------
-st.header("⚙️ Plan de asignación óptimo")
+# ---------------------------------------------------------------------------
+# Clustering
+# ---------------------------------------------------------------------------
+st.header("Caracterización no supervisada")
+tab_prod, tab_maq = st.tabs(["Productos", "Máquinas"])
 
+with tab_prod:
+    cv = cij.std(axis=1) / cij.mean(axis=1)
+    feats_prod = pd.DataFrame({"demanda": demanda, "cv_tiempo": cv})
+    tabla_k_prod = elbow_silhouette(feats_prod, k_range=range(2, 7))
+    clusters = clusterizar_productos(cij, demanda, n_clusters=n_clusters)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = go.Figure(go.Scatter(x=tabla_k_prod["k"], y=tabla_k_prod["inercia"], mode="lines+markers",
+                                   line=dict(color=BLUE, width=2.5), marker=dict(size=8)))
+        fig.update_xaxes(title="Número de clusters k")
+        fig.update_yaxes(title="Inercia")
+        st.plotly_chart(fig_layout(fig, "Método del codo", height=330, legend=False), use_container_width=True)
+    with c2:
+        best_k = int(tabla_k_prod.loc[tabla_k_prod["silhouette"].idxmax(), "k"])
+        fig = go.Figure(go.Scatter(x=tabla_k_prod["k"], y=tabla_k_prod["silhouette"], mode="lines+markers",
+                                   line=dict(color=TEAL, width=2.5), marker=dict(size=8)))
+        fig.add_trace(go.Scatter(x=[best_k], y=[tabla_k_prod["silhouette"].max()], mode="markers",
+                                 marker=dict(size=14, color=AMBER), name=f"Máximo: k={best_k}"))
+        fig.update_xaxes(title="Número de clusters k")
+        fig.update_yaxes(title="Silhouette")
+        st.plotly_chart(fig_layout(fig, "Separación de clusters", height=330), use_container_width=True)
+
+    fig = go.Figure()
+    role_colors = {
+        "Producción continua (alto volumen)": TEAL,
+        "Rotación media": BLUE,
+        "Comodín / baja escala": AMBER,
+    }
+    for rol, sub in clusters.groupby("rol_sugerido"):
+        fig.add_trace(go.Scatter(
+            x=sub["demanda"], y=sub["cv_tiempo"], mode="markers", name=rol,
+            marker=dict(size=9, color=role_colors.get(rol, SLATE), opacity=0.82,
+                        line=dict(color=BG, width=0.5)),
+            text=sub.index,
+            hovertemplate="%{text}<br>Demanda=%{x:.0f}<br>CV=%{y:.3f}<extra></extra>",
+        ))
+    fig.update_xaxes(title="Demanda diaria (unidades)")
+    fig.update_yaxes(title="Coeficiente de variación del tiempo")
+    st.plotly_chart(fig_layout(fig, "Mapa de productos: volumen y sensibilidad a la máquina", height=430), use_container_width=True)
+
+    test_dem = prueba_estadistica_clusters(clusters["demanda"], clusters["cluster"])
+    test_cv = prueba_estadistica_clusters(clusters["cv_tiempo"], clusters["cluster"])
+    s1, s2 = st.columns(2)
+    s1.metric("Kruskal-Wallis demanda", f"H={test_dem['estadistico_H']:.2f}", f"ε²={test_dem['epsilon2']:.3f}")
+    s2.metric("Kruskal-Wallis variabilidad", f"H={test_cv['estadistico_H']:.2f}", f"ε²={test_cv['epsilon2']:.3f}")
+    st.caption(
+        "Estas pruebas describen separación sobre variables usadas para construir los clusters; no deben interpretarse "
+        "como validación externa del agrupamiento. El tamaño de efecto ε² complementa el valor p."
+    )
+
+with tab_maq:
+    feats_maq = pd.DataFrame({
+        "setup_promedio": setup,
+        "tiempo_operacion_promedio": cij.mean(axis=0),
+        "varianza_tiempo": cij.var(axis=0),
+    })
+    tabla_k_maq = elbow_silhouette(feats_maq, k_range=range(2, 6))
+    n_clusters_maq = st.slider("Clusters de máquinas", 2, 5, 3, key="clusters_maq")
+    clusters_maq = clusterizar_maquinas(cij, setup, n_clusters=n_clusters_maq)
+    concord = concordancia_kmeans_ward_maquinas(cij, setup, n_clusters=n_clusters_maq)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("ARI K-Means vs Ward", f"{concord['ari']:.3f}")
+    m2.metric("Silhouette K-Means", f"{concord['silhouette_kmeans']:.3f}")
+    m3.metric("Silhouette Ward", f"{concord['silhouette_ward']:.3f}")
+    st.dataframe(
+        clusters_maq[["setup_promedio", "tiempo_operacion_promedio", "varianza_tiempo", "grupo_sugerido"]],
+        use_container_width=True,
+    )
+    st.caption("ARI=1 significa concordancia exacta entre las dos particiones comparadas; no demuestra que exista una única partición verdadera.")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Resolver plan base
+# ---------------------------------------------------------------------------
 if correr:
-    with st.spinner("Resolviendo el modelo de programación lineal..."):
-        resultado = resolver_asignacion(
-            cij, demanda, setup, cap_minutos=cap_min, tiempo_limite_seg=tiempo_limite
-        )
-    st.session_state["resultado"] = resultado
+    with st.spinner("Resolviendo el MILP diario..."):
+        try:
+            resultado = resolver_asignacion(cij, demanda_entera(demanda), setup, cap_min, tiempo_limite)
+            st.session_state["resultado_diario"] = resultado
+        except Exception as exc:
+            st.error(f"El modelo no pudo resolverse: {exc}")
 
-resultado = st.session_state.get("resultado")
-
+resultado = st.session_state.get("resultado_diario")
 if resultado is None:
-    st.warning("Da clic en **Calcular plan de producción** en la barra lateral para resolver el modelo.")
+    st.info("Selecciona **Calcular plan diario** para habilitar los análisis de decisión.")
     st.stop()
 
-asignacion = resultado["asignacion"]
-util = resultado["utilizacion_min"]
-n_setups = resultado["n_setups"]
-util_pct_max = float((util / resultado["cap_minutos"] * 100).max())
+caps = resultado["capacidad_min"]
+util_pct = resultado["utilizacion_min"] / caps * 100
+z = resultado["valor_objetivo"]
+z_prod = float(resultado["tiempo_produccion_min"].sum())
+z_setup = float(resultado["tiempo_setup_min"].sum())
+setup_share = 100 * z_setup / z if z else np.nan
+slack_total = float(resultado["holgura_min"].sum())
+balance_sd = float(util_pct.std(ddof=0))
+soporte = soporte_observado_solucion(resultado["asignacion"], audit["mask_observado"])
 
-# ---- Fila de tarjetas KPI ----
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-with kpi1:
-    st.metric("Estado del solver", resultado["estado"],
-              "GAP 0%" if resultado["gap_certificado"] else "sin certificar")
-with kpi2:
-    st.metric("Tiempo total", f"{resultado['valor_objetivo']:,.0f} min".replace(",", "."))
-with kpi3:
-    st.metric("Utilización máxima", f"{util_pct_max:.1f}%")
-with kpi4:
-    maquina_top = util.idxmax()
-    st.metric("Máquina más cargada", maquina_top, f"{util_pct_max:.1f}%")
-with kpi5:
-    st.metric("Total de alistamientos", int(n_setups.sum()))
+st.header("Plan diario optimizado")
+ka, kb, kc, kd, ke, kf = st.columns(6)
+ka.metric("Objetivo", f"{fmt_num(z, 2)} min")
+kb.metric("Producción", f"{fmt_num(z_prod, 1)} min")
+kc.metric("Setups", f"{fmt_num(z_setup, 1)} min", f"{setup_share:.1f}% del objetivo")
+kd.metric("Holgura agregada", f"{fmt_num(slack_total, 1)} min")
+ke.metric("Utilización máxima", f"{util_pct.max():.1f}%", util_pct.idxmax())
+kf.metric("Balance de carga", f"σ={balance_sd:.1f} pts")
+
+if resultado["gap_certificado"]:
+    badge("Óptimo certificado · GAP 0%", "ok")
+elif resultado["gap_pct"] is not None:
+    badge(f"Solución sin cierre total · GAP {resultado['gap_pct']:.2f}%", "warn")
+else:
+    badge(f"Estado solver: {resultado['estado']}", "warn")
+if resultado.get("solver_termination", {}).get("stopped_on_time"):
+    st.caption("CBC se detuvo por límite de tiempo. La solución mostrada es incumbente factible si los residuos son nulos; no debe presentarse como óptimo certificado.")
+
+r = resultado["residuos"]
+if max(r.values()) <= 1e-6:
+    badge("Residuos de factibilidad ≤ 10⁻⁶", "ok")
+else:
+    badge("Revisar residuos de factibilidad", "bad")
 
 st.markdown("")
 
-tab_plan, tab_comp, tab_sens, tab_cuello, tab_multi = st.tabs([
-    "📋 Plan y utilización",
-    "⚖️ Vs. política empírica",
-    "📈 Sensibilidad a la demanda",
-    "🚧 Cuello de botella",
-    "🗓️ Plan multi-día (200 refs)",
+plan_tab, comp_tab, sens_tab, cuello_tab, multi_tab, mc_tab = st.tabs([
+    "Plan y capacidad", "Vs. política", "Sensibilidad", "Capacidad crítica", "Multi-día", "Monte Carlo"
 ])
 
-# ---------------- TAB 1: Plan y utilización ----------------
-with tab_plan:
-    col_chart, col_gauge = st.columns([2.3, 1])
-    with col_chart:
-        st.plotly_chart(grafico_utilizacion(util, resultado["cap_minutos"]), use_container_width=True)
-    with col_gauge:
-        gauge_con_titulo(util_pct_max, "Utilización máxima", umbral_bueno=95, umbral_malo=80)
-        gauge_con_titulo(100 if resultado["gap_certificado"] else 0, "GAP certificado", umbral_bueno=99)
+# ---------------------------------------------------------------------------
+# Tab 1: plan
+# ---------------------------------------------------------------------------
+with plan_tab:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(grafico_utilizacion(resultado["utilizacion_min"], caps), use_container_width=True)
+    with c2:
+        st.plotly_chart(grafico_descomposicion(resultado), use_container_width=True)
 
-    resumen = pd.DataFrame({
-        "Utilización (min)": util.round(1),
-        "% de capacidad": (util / resultado["cap_minutos"] * 100).round(1),
-        "N° de Set-ups": n_setups,
-    })
-    st.dataframe(resumen, use_container_width=True)
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Setups activos", int(resultado["n_setups"].sum()))
+    s2.metric("Pares producto-máquina activos", resultado["pares_activos"])
+    s3.metric("Referencias divididas", resultado["referencias_divididas"])
+    s4.metric("Pares con Cij observado", f"{soporte['share_pares_observados_pct']:.1f}%",
+              f"{soporte['pares_imputados']} pares imputados")
+    s5.metric("Unidades con Cij observado", f"{soporte['share_unidades_observadas_pct']:.1f}%",
+              f"{fmt_num(soporte['unidades_en_celdas_imputadas'], 0)} unid. sobre Cij imputado")
 
-    st.subheader("¿Cuánto producir de cada referencia y en qué máquina?")
-    tabla = asignacion[asignacion.sum(axis=1) > 0].copy()
-    tabla = tabla.loc[demanda.reindex(tabla.index).sort_values(ascending=False).index]
-    tabla_mostrar = tabla.round(0).replace(0, "")
-    st.dataframe(tabla_mostrar, use_container_width=True)
+    if soporte["unidades_en_celdas_imputadas"] > 0:
+        st.caption(
+            "La dependencia de datos imputados debe interpretarse por pares activos y también por volumen: "
+            "un único par puede concentrar muchas unidades. Por eso se reportan ambas métricas."
+        )
+
+    st.markdown(
+        '<div class="technical-note"><b>Lectura operativa.</b> La utilización alta indica poco margen, pero no basta para '
+        'identificar el cuello de botella. El análisis marginal de la pestaña <i>Capacidad crítica</i> vuelve a resolver '
+        'el MILP para medir cuánto vale realmente un minuto adicional en cada máquina.</div>',
+        unsafe_allow_html=True,
+    )
+
+    plan = long_plan(resultado["asignacion"])
+    plan["tiempo_unitario_min"] = [cij.loc[p, m] for p, m in zip(plan["producto"], plan["maquina"])]
+    plan["origen_Cij"] = ["Observado" if audit["mask_observado"].loc[p, m] else "Imputado"
+                           for p, m in zip(plan["producto"], plan["maquina"])]
+    st.subheader("Asignaciones recomendadas")
+    st.dataframe(plan, use_container_width=True, hide_index=True)
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        tabla.round(1).to_excel(writer, sheet_name="Asignacion")
-        resumen.to_excel(writer, sheet_name="Utilizacion")
-        clusters.to_excel(writer, sheet_name="Clusters")
-    st.download_button(
-        "⬇️ Descargar plan en Excel",
-        data=buffer.getvalue(),
-        file_name="plan_produccion_rpm.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        plan.to_excel(writer, sheet_name="Plan", index=False)
+        pd.DataFrame({
+            "utilizacion_min": resultado["utilizacion_min"],
+            "produccion_min": resultado["tiempo_produccion_min"],
+            "setup_min": resultado["tiempo_setup_min"],
+            "holgura_min": resultado["holgura_min"],
+            "capacidad_min": caps,
+            "utilizacion_pct": util_pct,
+        }).to_excel(writer, sheet_name="Capacidad")
+        pd.DataFrame([{
+            "objetivo_min": z,
+            "produccion_min": z_prod,
+            "setup_min": z_setup,
+            "setup_share_pct": setup_share,
+            "holgura_total_min": slack_total,
+            "balance_sd_pct": balance_sd,
+            "gap_pct": resultado["gap_pct"],
+            **{f"residuo_{k}": v for k, v in r.items()},
+        }]).to_excel(writer, sheet_name="Metricas", index=False)
+    st.download_button("Descargar plan y métricas en Excel", buffer.getvalue(), "plan_diario_rpm.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ---------------- TAB 2: Comparación vs. política empírica ----------------
-with tab_comp:
-    st.write(
-        "Compara el modelo óptimo contra una **política empírica de referencia** "
-        "(heurística greedy: asigna cada producto, de mayor a menor demanda, a la "
-        "máquina más rápida con capacidad disponible — sin anticipar el efecto "
-        "sobre los demás productos, como haría un supervisor sin apoyo de un "
-        "modelo). *No es un dato histórico real de RPM Colombia: es una línea "
-        "base estándar de la literatura para poder cuantificar la mejora.*"
-    )
-    if st.button("Calcular política empírica y comparar"):
-        with st.spinner("Calculando política empírica..."):
-            emp = politica_empirica(cij, demanda, setup, cap_minutos=resultado["cap_minutos"])
-        mejora = (emp["valor_objetivo"] - resultado["valor_objetivo"]) / emp["valor_objetivo"] * 100
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Tiempo total — modelo óptimo", f"{resultado['valor_objetivo']:.0f} min")
-        c2.metric("Tiempo total — política empírica", f"{emp['valor_objetivo']:.0f} min")
-        c3.metric("Mejora del modelo óptimo", f"{mejora:.1f} %")
-
-        fig_comp = go.Figure()
-        fig_comp.add_bar(x=["Modelo óptimo", "Política empírica"],
-                          y=[resultado["valor_objetivo"], emp["valor_objetivo"]],
-                          marker_color=[ACCENT, MUTED],
-                          text=[f"{resultado['valor_objetivo']:,.0f} min", f"{emp['valor_objetivo']:,.0f} min"],
-                          textposition="outside", textfont=dict(color=TEXT))
-        fig_comp.update_yaxes(title="Tiempo total (min)", gridcolor=CARD_BORDER)
-        st.plotly_chart(fig_layout(fig_comp, f"Mejora del modelo óptimo: {mejora:.1f}%", height=380),
-                         use_container_width=True)
-
-        if len(emp["demanda_incumplida"]) > 0:
-            st.warning("La política empírica NO alcanza a cumplir toda la demanda en estas referencias:")
-            st.dataframe(emp["demanda_incumplida"])
-        else:
-            st.info("La política empírica sí alcanza a cumplir el 100 % de la demanda, pero usando más tiempo total.")
-
-# ---------------- TAB 3: Sensibilidad a la demanda ----------------
-with tab_sens:
-    st.write(
-        "Resuelve el modelo variando la demanda para ver qué tan estable es la "
-        "solución — la pregunta típica de sustentación: *¿qué pasa si la demanda "
-        "sube o baja?*"
-    )
-    if st.button("Ejecutar análisis de sensibilidad (5 corridas)"):
-        with st.spinner("Resolviendo 5 escenarios de demanda (±20 %, ±10 %, base)..."):
-            sens = analisis_sensibilidad(cij, demanda, setup, cap_minutos=resultado["cap_minutos"],
-                                          tiempo_limite_seg=tiempo_limite)
-        st.dataframe(sens, use_container_width=True)
-
-        fig4 = go.Figure()
-        fig4.add_scatter(x=sens["factor_demanda"], y=sens["valor_objetivo_min"], mode="lines+markers",
-                          name="Tiempo total", line=dict(color=ACCENT, width=2.5), marker=dict(size=8),
-                          yaxis="y1")
-        fig4.add_scatter(x=sens["factor_demanda"], y=sens["utilizacion_maxima_pct"], mode="lines+markers",
-                          name="Utilización máxima (%)", line=dict(color=DANGER, width=2, dash="dash"),
-                          marker=dict(size=8, symbol="square"), yaxis="y2")
-        fig4.update_layout(
-            xaxis=dict(title="Factor de demanda (1.0 = demanda real)", gridcolor=CARD_BORDER),
-            yaxis=dict(title="Tiempo total (min)", gridcolor=CARD_BORDER, titlefont=dict(color=ACCENT)),
-            yaxis2=dict(title="Utilización máxima (%)", overlaying="y", side="right", showgrid=False,
-                        titlefont=dict(color=DANGER)),
-            legend=dict(font=dict(color=TEXT, size=11), orientation="h", yanchor="bottom", y=1.02, x=0),
+# ---------------------------------------------------------------------------
+# Tab 2: comparación
+# ---------------------------------------------------------------------------
+with comp_tab:
+    emp = politica_empirica(cij, demanda_entera(demanda), setup, cap_min)
+    incumplidas = int(emp["demanda_incumplida"].sum()) if len(emp["demanda_incumplida"]) else 0
+    if incumplidas > 0:
+        st.warning(
+            f"La heurística greedy no logra cubrir {incumplidas} unidades con la capacidad disponible. "
+            "En ese caso no es metodológicamente correcto calcular un porcentaje de mejora sobre su objetivo."
         )
-        st.plotly_chart(fig_layout(fig4, "Sensibilidad del sistema a la demanda", height=440,
-                                    margin=dict(l=50, r=50, t=95, b=40)),
-                         use_container_width=True)
-
-# ---------------- TAB 4: Cuello de botella ----------------
-with tab_cuello:
-    st.write(
-        "Identifica qué máquina es el verdadero **cuello de botella** del "
-        "sistema: se le da a cada máquina, una por una, 30 minutos adicionales "
-        "de capacidad y se mide cuánto mejora el tiempo total. La que más "
-        "mejora genera es el cuello de botella real — el 'tambor' del sistema "
-        "en términos de la Teoría de Restricciones (DBR)."
-    )
-    st.caption(
-        "Nota técnica: se usa re-optimización directa en vez del precio sombra "
-        "clásico, porque en este modelo (con variables binarias Yij) el dual "
-        "resulta degenerado — ver justificación en rpm_core.py."
-    )
-    if st.button("Calcular cuello de botella (11 resoluciones, ~1-2 min)"):
-        with st.spinner("Resolviendo 11 escenarios de capacidad..."):
-            cuello = analisis_cuello_de_botella(cij, demanda, setup,
-                                                 cap_minutos=resultado["cap_minutos"],
-                                                 tiempo_limite_seg=tiempo_limite)
-        cuello_ordenado = cuello.dropna(subset=["mejora_min_por_+30min_capacidad"]).sort_values(
-            "mejora_min_por_+30min_capacidad")
-        excluidas = cuello[cuello["mejora_min_por_+30min_capacidad"].isna()]
-        if len(excluidas) > 0:
-            st.warning(
-                f"⚠️ {len(excluidas)} máquina(s) no alcanzaron GAP=0% certificado dentro del "
-                f"tiempo límite del solver ({tiempo_limite}s) y se excluyeron del gráfico para no "
-                f"mostrar un valor engañoso: {', '.join(excluidas['maquina'].tolist())}. "
-                f"Sube el tiempo máximo de cómputo en la barra lateral para incluirlas."
-            )
-        fig_c = go.Figure()
-        colores_c = [DANGER if v == cuello_ordenado["mejora_min_por_+30min_capacidad"].max() else ACCENT
-                     for v in cuello_ordenado["mejora_min_por_+30min_capacidad"]]
-        fig_c.add_bar(y=cuello_ordenado["maquina"], x=cuello_ordenado["mejora_min_por_+30min_capacidad"],
-                      orientation="h", marker_color=colores_c,
-                      text=[f"{v:.2f} min" for v in cuello_ordenado["mejora_min_por_+30min_capacidad"]],
-                      textposition="outside", textfont=dict(color=TEXT))
-        fig_c.update_xaxes(title="Mejora en el tiempo total (min) por +30 min de capacidad", gridcolor=CARD_BORDER)
-        st.plotly_chart(fig_layout(fig_c, "¿Cuál máquina es el cuello de botella real?", height=420),
-                         use_container_width=True)
-
-        st.dataframe(cuello, use_container_width=True)
-        top = cuello.iloc[0]
-        st.success(f"**{top['maquina']}** es el cuello de botella real del sistema: "
-                   f"cada 30 minutos adicionales de su capacidad reducen el tiempo "
-                   f"total en {top['mejora_min_por_+30min_capacidad']:.2f} min.")
-
-# ---------------- TAB 5: Plan multi-día (200 referencias) ----------------
-with tab_multi:
-    st.write(
-        "Extiende el modelo a las **200 referencias del catálogo completo**, "
-        "repartiendo la producción en varios días en vez de intentar meterlas "
-        "todas en uno solo. Corrige, además, un sesgo detectado en la manera "
-        "de estimar la demanda de las referencias que no tienen medición "
-        "directa (ventas del semestre ÷ días hábiles), que sobreestimaba la "
-        "demanda real."
-    )
-
-    cma, cmb, cmc = st.columns(3)
-    with cma:
-        dias_habiles_input = st.number_input(
-            "Días hábiles usados para estimar la demanda", min_value=60, max_value=300, value=180, step=10,
-        )
-    with cmb:
-        dias_horizonte = st.slider("Días del horizonte de planeación", 2, 7, 3)
-    with cmc:
-        tiempo_limite_multi = st.slider(
-            "Tiempo máx. del solver multi-día (seg)", 30, 300, 120,
-            help="El modelo multi-día es más grande (200 refs x 10 máquinas x N días); puede tardar más.",
-        )
-
-    if st.button("🗓️ Calcular plan multi-día", type="primary"):
-        with st.spinner("Cargando el catálogo completo (200 referencias)..."):
-            datos_200 = cargar_datos_extendido(
-                archivo if archivo is not None else "AnexodeDatosxlsx.xlsx",
-                dias_habiles=dias_habiles_input,
-            )
-        cij_200, demanda_200, setup_200 = datos_200["cij"], datos_200["demanda"], datos_200["setup"]
-
-        cal = calibrar_demanda_extendida(demanda, demanda_200)
-        st.info(
-            f"Se detectó un factor de sobreestimación de **{cal['factor_sesgo']:.2f}x** "
-            f"al comparar las {cal['n_referencias_comunes']} referencias que existen en "
-            f"ambas fuentes de datos. La demanda de las 200 referencias se corrigió "
-            f"dividiendo por ese factor antes de resolver el modelo."
-        )
-        demanda_horizonte = cal["demanda_calibrada"] * dias_horizonte
-
-        with st.spinner(f"Resolviendo el modelo multi-día ({dias_horizonte} días, "
-                         f"{len(cij_200)} referencias)... puede tardar 1-3 minutos."):
-            res_multi = resolver_multidia(
-                cij_200, demanda_horizonte, setup_200,
-                dias=dias_horizonte, cap_minutos=cap_min, tiempo_limite_seg=tiempo_limite_multi,
-            )
-        st.session_state["resultado_multi"] = res_multi
-
-    res_multi = st.session_state.get("resultado_multi")
-
-    if res_multi is None:
-        st.warning("Da clic en **Calcular plan multi-día** para resolver el modelo.")
     else:
-        estado_txt = res_multi["estado"]
+        mejora = (emp["valor_objetivo"] - z) / emp["valor_objetivo"] * 100
+        c1, c2, c3 = st.columns(3)
+        c1.metric("MILP", f"{fmt_num(z, 1)} min")
+        c2.metric("Política greedy integral", f"{fmt_num(emp['valor_objetivo'], 1)} min")
+        c3.metric("Reducción relativa", f"{mejora:.2f}%")
 
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.metric("Estado del solver", estado_txt)
-        with m2:
-            st.metric("Tiempo total (horizonte)", f"{res_multi['valor_objetivo']:,.0f} min".replace(",", "."))
-        with m3:
-            st.metric("Horizonte", f"{res_multi['dias']} días")
-        with m4:
-            refs_cubiertas = res_multi["plan"]["producto"].nunique() if len(res_multi["plan"]) else 0
-            st.metric("Referencias cubiertas", refs_cubiertas)
+        fig = go.Figure()
+        fig.add_bar(x=MACHINES, y=resultado["utilizacion_min"][MACHINES], name="MILP", marker_color=TEAL)
+        fig.add_bar(x=MACHINES, y=emp["utilizacion_min"][MACHINES], name="Greedy", marker_color=SLATE)
+        fig.update_layout(barmode="group")
+        fig.update_yaxes(title="Minutos utilizados")
+        fig.update_xaxes(title="Máquina")
+        st.plotly_chart(fig_layout(fig, "Distribución de carga: MILP vs política de referencia", height=420), use_container_width=True)
 
-        if estado_txt == "Optimal":
-            st.markdown("")
-            badge("GAP = 0 % — óptimo certificado, catálogo completo cubierto", "ok")
-        elif estado_txt == "Infeasible":
-            badge(f"Infactible con {res_multi['dias']} días — prueba a aumentar el horizonte", "bad")
-        else:
-            badge("Sin GAP certificado — sube el tiempo límite del solver", "warn")
+    st.caption(
+        "La política de referencia es una heurística reproducible, no un registro histórico de decisiones de supervisores. "
+        "En esta versión también asigna unidades enteras, de modo que la comparación usa el mismo dominio físico que el MILP."
+    )
 
-        if len(res_multi["plan"]) > 0:
-            st.markdown("")
-            util_pct = (res_multi["utilizacion_dia_maquina"] / res_multi["cap_minutos"] * 100).round(1)
-            st.plotly_chart(heatmap_utilizacion(util_pct, "Utilización por día y máquina (%)"),
-                             use_container_width=True)
+# ---------------------------------------------------------------------------
+# Tab 3: sensibilidad
+# ---------------------------------------------------------------------------
+with sens_tab:
+    st.subheader("Sensibilidad a la demanda")
+    st.write(
+        "La demanda escalada se redondea a unidades enteras antes de resolver. Esto corrige la incompatibilidad anterior "
+        "entre una demanda fraccionaria y variables de producción enteras."
+    )
+    if st.button("Ejecutar sensibilidad de demanda", key="run_sens"):
+        with st.spinner("Resolviendo escenarios 80%, 90%, 100%, 110% y 120%..."):
+            sens = analisis_sensibilidad(cij, demanda, setup, cap_min, tiempo_limite_seg=tiempo_limite)
+        st.session_state["sensibilidad_demanda"] = sens
+    sens = st.session_state.get("sensibilidad_demanda")
+    if sens is not None:
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Scatter(
+            x=sens["factor_demanda"] * 100, y=sens["valor_objetivo_min"], mode="lines+markers",
+            line=dict(color=BLUE, width=2.6), marker=dict(size=8), name="Objetivo"
+        ), secondary_y=False)
+        fig.add_trace(go.Scatter(
+            x=sens["factor_demanda"] * 100, y=sens["utilizacion_maxima_pct"], mode="lines+markers",
+            line=dict(color=AMBER, width=2.2, dash="dot"), marker=dict(size=7), name="Utilización máxima"
+        ), secondary_y=True)
+        fig.update_xaxes(title="Demanda relativa al escenario base (%)")
+        fig.update_yaxes(title="Tiempo agregado óptimo (min)", secondary_y=False)
+        fig.update_yaxes(title="Utilización máxima (%)", secondary_y=True)
+        st.plotly_chart(fig_layout(fig, "Respuesta del sistema ante cambios de demanda", height=430), use_container_width=True)
+        st.dataframe(sens, use_container_width=True, hide_index=True)
 
-            st.subheader("Alistamientos (setups) por día y máquina")
-            st.dataframe(res_multi["setups_dia_maquina"], use_container_width=True)
-
-            st.subheader("Plan de producción — qué, dónde y cuándo")
-            dia_ver = st.selectbox("Ver el plan del día:", sorted(res_multi["plan"]["dia"].unique()))
-            plan_dia = res_multi["plan"][res_multi["plan"]["dia"] == dia_ver].copy()
-            plan_dia = plan_dia.sort_values("unidades", ascending=False)
-            plan_dia["unidades"] = plan_dia["unidades"].round(0)
-            st.dataframe(plan_dia[["maquina", "producto", "unidades"]], use_container_width=True, hide_index=True)
-
-            buffer_multi = io.BytesIO()
-            with pd.ExcelWriter(buffer_multi, engine="openpyxl") as writer:
-                res_multi["plan"].round(1).to_excel(writer, sheet_name="Plan_MultiDia", index=False)
-                util_pct.to_excel(writer, sheet_name="Utilizacion_Dia_Maquina")
-                res_multi["setups_dia_maquina"].to_excel(writer, sheet_name="Setups_Dia_Maquina")
-            st.download_button(
-                "⬇️ Descargar plan multi-día en Excel",
-                data=buffer_multi.getvalue(),
-                file_name="plan_multidia_rpm.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.subheader("Sensibilidad a las celdas imputadas")
+    if st.button("Perturbar celdas imputadas ±20%", key="run_imp_sens"):
+        with st.spinner("Reoptimizando la matriz con valores imputados -20%, base y +20%..."):
+            imp_sens = analisis_sensibilidad_imputacion(
+                cij, audit["mask_observado"], demanda_entera(demanda), setup,
+                factores=(0.8, 1.0, 1.2), cap_minutos=cap_min, tiempo_limite_seg=tiempo_limite,
             )
+        st.session_state["sensibilidad_imputacion"] = imp_sens
+    imp_sens = st.session_state.get("sensibilidad_imputacion")
+    if imp_sens is not None:
+        fig = go.Figure(go.Bar(
+            x=[f"{v:+.0f}%" for v in imp_sens["variacion_imputadas_pct"]],
+            y=imp_sens["valor_objetivo_min"],
+            marker_color=[TEAL, BLUE, AMBER],
+            text=[fmt_num(v, 1) for v in imp_sens["valor_objetivo_min"]], textposition="outside",
+        ))
+        fig.update_xaxes(title="Perturbación aplicada solo a celdas imputadas")
+        fig.update_yaxes(title="Objetivo óptimo (min)")
+        st.plotly_chart(fig_layout(fig, "Dependencia del óptimo respecto a la imputación", height=380, legend=False), use_container_width=True)
+        st.dataframe(imp_sens, use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# Tab 4: capacidad crítica
+# ---------------------------------------------------------------------------
+with cuello_tab:
+    st.write(
+        "Se agregan 30 minutos a una máquina por vez y se vuelve a resolver exactamente el mismo MILP. "
+        "La razón ηj mide la reducción del objetivo por minuto adicional de capacidad."
+    )
+    delta_cap = st.number_input("Incremento de capacidad por escenario (min)", 5, 120, 30, 5)
+    if st.button("Calcular valor marginal de capacidad", key="run_bottleneck"):
+        with st.spinner("Reoptimizando capacidad máquina por máquina..."):
+            cuello = analisis_cuello_de_botella(cij, demanda_entera(demanda), setup, cap_min, delta_cap, tiempo_limite)
+        st.session_state["cuello"] = cuello
+    cuello = st.session_state.get("cuello")
+    if cuello is not None:
+        valid = cuello.dropna(subset=["eta_min_por_min"]).sort_values("eta_min_por_min")
+        fig = go.Figure(go.Bar(
+            y=valid["maquina"], x=valid["eta_min_por_min"], orientation="h", marker_color=BLUE,
+            text=[f"{v:.3f}" for v in valid["eta_min_por_min"]], textposition="outside",
+        ))
+        fig.update_xaxes(title="ηj = reducción del objetivo / minuto adicional")
+        st.plotly_chart(fig_layout(fig, "Valor marginal finito de capacidad", height=410, legend=False), use_container_width=True)
+
+        fig2 = go.Figure(go.Scatter(
+            x=cuello["utilizacion_actual_pct"], y=cuello["eta_min_por_min"], mode="markers+text",
+            text=cuello["maquina"], textposition="top center",
+            marker=dict(size=11, color=TEAL, line=dict(color=LIGHT, width=0.5)),
+        ))
+        fig2.update_xaxes(title="Utilización actual (%)")
+        fig2.update_yaxes(title="ηj (min/min)")
+        st.plotly_chart(fig_layout(fig2, "Utilización no equivale a valor marginal", height=390, legend=False), use_container_width=True)
+        st.dataframe(cuello, use_container_width=True, hide_index=True)
+        if len(cuello):
+            top = cuello.iloc[0]
+            st.success(
+                f"Mayor respuesta marginal: {top['maquina']}. Un aumento de {top['delta_capacidad_min']:.0f} min "
+                f"reduce el objetivo en {top['mejora_objetivo_min']:.2f} min, η={top['eta_min_por_min']:.4f}."
+            )
+
+# ---------------------------------------------------------------------------
+# Tab 5: multi-día
+# ---------------------------------------------------------------------------
+with multi_tab:
+    c1, c2, c3, c4 = st.columns(4)
+    dias_habiles_input = c1.number_input("Días hábiles para estimar demanda", 60, 300, 180, 10)
+    dias_horizonte = c2.slider("Horizonte de planeación (días)", 2, 7, 3)
+    tiempo_multi = c3.slider("Tiempo máximo CBC multi-día (s)", 30, 600, 120)
+    gap_obj_multi_pct = c4.select_slider("GAP objetivo multi-día", options=[0.1, 0.25, 0.5, 1.0, 2.0], value=0.5, format_func=lambda x: f"{x:.2f}%")
+
+    if st.button("Calcular plan multi-día", key="run_multi"):
+        with st.spinner("Preparando catálogo completo y demanda calibrada..."):
+            datos_200 = cargar_datos_extendido(source(), dias_habiles=dias_habiles_input)
+            cal = calibrar_demanda_extendida(demanda, datos_200["demanda"])
+            demanda_teorica = cal["demanda_calibrada"] * dias_horizonte
+            demanda_horizonte = demanda_entera(demanda_teorica, 1.0, "round")
+            ajuste = float(demanda_horizonte.sum() - demanda_teorica.sum())
+        with st.spinner(f"Resolviendo {len(datos_200['cij'])} referencias en {dias_horizonte} días..."):
+            res_multi = resolver_multidia(
+                datos_200["cij"], demanda_horizonte, datos_200["setup"], dias_horizonte,
+                cap_minutos=cap_min, tiempo_limite_seg=tiempo_multi,
+                gap_rel=float(gap_obj_multi_pct) / 100.0,
+            )
+        st.session_state["resultado_multi"] = {
+            "res": res_multi, "cal": cal, "ajuste": ajuste,
+            "demanda_teorica": float(demanda_teorica.sum()), "demanda_entera": int(demanda_horizonte.sum()),
+        }
+
+    multi_state = st.session_state.get("resultado_multi")
+    if multi_state is not None:
+        res_multi = multi_state["res"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Estado", res_multi["estado"])
+        m2.metric("Objetivo", f"{fmt_num(res_multi['valor_objetivo'], 1)} min" if res_multi["valor_objetivo"] else "N/D")
+        m3.metric("Demanda entera del horizonte", fmt_num(multi_state["demanda_entera"], 0),
+                  f"ajuste {multi_state['ajuste']:+.1f} unid.")
+        gap_text = "0.00%" if res_multi["gap_certificado"] else (f"{res_multi['gap_pct']:.2f}%" if res_multi["gap_pct"] is not None else "N/D")
+        m4.metric("GAP", gap_text)
+        st.caption(
+            f"Factor de calibración de demanda extendida: {multi_state['cal']['factor_sesgo']:.3f}x. "
+            f"El redondeo del horizonte se reporta explícitamente porque la variable de producción es entera. "
+            f"CBC usa un GAP objetivo de {gap_obj_multi_pct:.2f}% para equilibrar calidad de solución y tiempo de cómputo."
+        )
+        lb_multi = res_multi.get("lower_bound")
+        ub_multi = res_multi.get("upper_bound")
+        b1, b2, b3 = st.columns(3)
+        b1.metric("LB solver", f"{fmt_num(lb_multi, 1)} min" if lb_multi is not None else "N/D")
+        b2.metric("UB / incumbente", f"{fmt_num(ub_multi, 1)} min" if ub_multi is not None else "N/D")
+        b3.metric("Criterio GAP", f"≤ {gap_obj_multi_pct:.2f}%")
+        if res_multi.get("solver_termination", {}).get("stopped_on_time"):
+            st.warning("El solver alcanzó el límite de tiempo. El plan puede ser factible, pero no se presenta como óptimo; revise UB, LB y GAP cuando estén disponibles.")
+
+        if len(res_multi["plan"]):
+            util_pct_multi = res_multi["utilizacion_dia_maquina"].div(res_multi["capacidad_min"], axis=1) * 100
+            st.plotly_chart(heatmap_utilizacion(util_pct_multi, "Utilización por día y máquina"), use_container_width=True)
+            mm1, mm2, mm3 = st.columns(3)
+            mm1.metric("Unidades producidas", fmt_num(res_multi["plan"]["unidades"].sum(), 0))
+            mm2.metric("Lote promedio", fmt_num(res_multi["plan"]["unidades"].mean(), 1))
+            mm3.metric("σ utilización día-máquina", f"{util_pct_multi.stack().std(ddof=0):.1f} pts")
+            st.dataframe(res_multi["plan"].sort_values(["dia", "maquina", "unidades"], ascending=[True, True, False]),
+                         use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# Tab 6: Monte Carlo
+# ---------------------------------------------------------------------------
+with mc_tab:
+    st.write(
+        "La simulacion Monte Carlo es deliberadamente opcional. La app muestra primero la corrida de referencia "
+        "documentada en la tesis y solo resuelve escenarios nuevos cuando el usuario lo solicita."
+    )
+
+    ref_mc = cargar_referencia_monte_carlo()
+    if ref_mc is not None:
+        st.markdown("#### Referencia documentada en la tesis")
+        r1, r2, r3, r4, r5 = st.columns(5)
+        r1.metric("Escenarios", f"{ref_mc['n']}")
+        r2.metric("Mejora media", f"{ref_mc['media_pct']:.2f}%")
+        r3.metric("Mediana", f"{ref_mc['mediana_pct']:.2f}%")
+        r4.metric("Desv. estandar", f"{ref_mc['sd_pct']:.2f} pp")
+        r5.metric("IC 95%", f"[{ref_mc['ci95_low_pct']:.2f}, {ref_mc['ci95_high_pct']:.2f}]%")
+        rr1, rr2, rr3, rr4 = st.columns(4)
+        rr1.metric("Error estandar", f"{ref_mc['se_pct']:.3f} pp")
+        rr2.metric("Rango", f"[{ref_mc['min_pct']:.2f}, {ref_mc['max_pct']:.2f}]%")
+        rr3.metric("Mejora positiva", f"{100*ref_mc['positive_count']/ref_mc['n']:.1f}%")
+        rr4.metric("GAP solver", f"{ref_mc['solver_gap_pct']:.2f}%")
+        st.caption(ref_mc["methodology_note"])
+
+    st.markdown("#### Ejecutar una simulacion nueva")
+    c1, c2, c3 = st.columns(3)
+    preset = c1.radio(
+        "Tamano de corrida",
+        ["Rapida (30)", "Intermedia (100)", "Validacion (1000)"],
+        horizontal=False,
+        index=0,
+    )
+    n_map = {"Rapida (30)": 30, "Intermedia (100)": 100, "Validacion (1000)": 1000}
+    n_mc = n_map[preset]
+    seed_mc = c2.number_input("Semilla", min_value=0, max_value=999999, value=42, step=1)
+    tiempo_mc = c3.slider("Limite CBC por escenario (s)", 5, 120, min(30, tiempo_limite), 5)
+
+    st.caption(
+        "Cada escenario perturba cada demanda de referencia de forma independiente con U(0,85; 1,15), "
+        "redondea a unidades enteras y compara el MILP con la politica greedy integral. "
+        "Los resultados se almacenan en cache durante 24 horas para no repetir una corrida identica."
+    )
+    if n_mc >= 1000:
+        st.warning(
+            "La corrida N=1000 es computacionalmente costosa y no se ejecuta automaticamente. "
+            "En Streamlit Cloud conviene usarla solo cuando se desea reproducir la validacion completa."
+        )
+
+    if st.button("Ejecutar nueva simulacion Monte Carlo", key="run_mc"):
+        with st.spinner(f"Resolviendo {n_mc} escenarios MILP y {n_mc} politicas de referencia..."):
+            mc = ejecutar_monte_carlo_cache(
+                cij, demanda, setup, n_mc, int(seed_mc), 0.85, 1.15,
+                cap_min, int(tiempo_mc),
+            )
+        st.session_state["mc"] = mc
+
+    mc = st.session_state.get("mc")
+    if mc is not None:
+        s_mc = mc["resumen"]
+        st.markdown("#### Resultado de la nueva corrida")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Optimos certificados", f"{s_mc['n_optimos_certificados']}/{s_mc['n_solicitados']}")
+        m2.metric("Mejora media", f"{s_mc['media_pct']:.2f}%")
+        m3.metric("Mediana", f"{s_mc['mediana_pct']:.2f}%")
+        m4.metric("Desv. estandar", f"{s_mc['sd_pct']:.2f} pp")
+        m5.metric("IC 95% media", f"[{s_mc['ci95_low_pct']:.2f}, {s_mc['ci95_high_pct']:.2f}]%")
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Error estandar", f"{s_mc['se_pct']:.3f} pp")
+        q2.metric("Intervalo P5-P95", f"[{s_mc['p5_pct']:.2f}, {s_mc['p95_pct']:.2f}]%")
+        q3.metric("Mejora positiva", f"{100*s_mc['proporcion_mejora_positiva']:.1f}%")
+        q4.metric("Rango observado", f"[{s_mc['min_pct']:.2f}, {s_mc['max_pct']:.2f}]%")
+
+        e = mc["escenarios"].dropna(subset=["mejora_certificada_pct"]).copy()
+        if s_mc["n_no_certificados"] > 0:
+            st.warning(
+                f"{s_mc['n_no_certificados']} escenarios no cerraron con optimalidad certificada dentro del limite de tiempo y "
+                "no se incluyen en los estadisticos inferenciales."
+            )
+        if len(e):
+            e["media_acumulada"] = e["mejora_certificada_pct"].expanding().mean()
+            e_ord = e.sort_values("mejora_certificada_pct").reset_index(drop=True)
+            e_ord["orden"] = np.arange(1, len(e_ord) + 1)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = go.Figure(go.Histogram(
+                    x=e["mejora_certificada_pct"], nbinsx=18, marker_color=BLUE, opacity=0.88
+                ))
+                fig.add_vline(x=s_mc["media_pct"], line_color=TEAL, line_width=2,
+                              annotation_text=f"media {s_mc['media_pct']:.2f}%", annotation_font_color=TEAL)
+                fig.add_vline(x=s_mc["p5_pct"], line_color=SLATE, line_dash="dot", line_width=1.4)
+                fig.add_vline(x=s_mc["p95_pct"], line_color=SLATE, line_dash="dot", line_width=1.4)
+                fig.update_xaxes(title="Mejora relativa certificada (%)")
+                fig.update_yaxes(title="Frecuencia")
+                st.plotly_chart(fig_layout(fig, "Distribucion de la mejora", height=380, legend=False), use_container_width=True)
+            with c2:
+                fig = go.Figure(go.Box(
+                    y=e["mejora_certificada_pct"], boxmean=True, marker_color=TEAL,
+                    line=dict(color=LIGHT), fillcolor="rgba(42,157,143,0.25)"
+                ))
+                fig.update_yaxes(title="Mejora relativa certificada (%)")
+                fig.update_xaxes(showticklabels=False)
+                st.plotly_chart(fig_layout(fig, "Dispersion y valores extremos", height=380, legend=False), use_container_width=True)
+
+            c3, c4 = st.columns(2)
+            with c3:
+                fig = go.Figure(go.Scatter(
+                    x=e_ord["orden"], y=e_ord["mejora_certificada_pct"], mode="lines",
+                    line=dict(color=BLUE, width=2.1)
+                ))
+                fig.add_hline(y=s_mc["media_pct"], line_color=TEAL, line_dash="dash", line_width=1.5)
+                fig.update_xaxes(title="Escenarios ordenados")
+                fig.update_yaxes(title="Mejora relativa certificada (%)")
+                st.plotly_chart(fig_layout(fig, "Escenarios ordenados por mejora", height=380, legend=False), use_container_width=True)
+            with c4:
+                fig = go.Figure(go.Scatter(
+                    x=np.arange(1, len(e) + 1), y=e["media_acumulada"], mode="lines",
+                    line=dict(color=TEAL, width=2.4)
+                ))
+                fig.add_hline(y=s_mc["media_pct"], line_color=SLATE, line_dash="dot", line_width=1.2)
+                fig.update_xaxes(title="Numero de escenarios certificados")
+                fig.update_yaxes(title="Media acumulada de mejora (%)")
+                st.plotly_chart(fig_layout(fig, "Convergencia de la media Monte Carlo", height=380, legend=False), use_container_width=True)
+
+            csv_mc = mc["escenarios"].to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "Descargar escenarios Monte Carlo (CSV)", csv_mc,
+                file_name=f"monte_carlo_N{n_mc}_seed{int(seed_mc)}.csv", mime="text/csv"
+            )
+
+        st.caption(
+            "Los estadisticos se calculan solo con escenarios cuyo MILP cerro con optimalidad certificada. "
+            "La frecuencia de mejora positiva es empirica y queda condicionada al mecanismo U(0,85;1,15); "
+            "no constituye una garantia para cualquier demanda futura."
+        )
+
