@@ -430,8 +430,8 @@ def _parsear_log_cbc(path: str) -> dict:
     """Extrae cotas, GAP y motivo de terminación del log de CBC."""
     out = {
         "lower_bound": None, "upper_bound": None, "gap_pct": None,
-        "stopped_on_time": False, "proven_optimal": False,
-        "termination_known": False,
+        "stopped_on_time": False, "stopped_on_gap": False,
+        "proven_optimal": False, "termination_known": False,
     }
     if not path or not os.path.exists(path):
         return out
@@ -445,12 +445,20 @@ def _parsear_log_cbc(path: str) -> dict:
         "stopped on time limit" in low
         or "result - stopped on time limit" in low
     )
+    # CBC puede devolver status=Optimal cuando termina dentro de la tolerancia
+    # de GAP. Eso NO equivale a demostrar optimalidad exacta del MILP.
+    out["stopped_on_gap"] = (
+        "within gap tolerance" in low
+        or "gap tolerance" in low and "optimal solution found" in low
+    )
     out["proven_optimal"] = (
         "result - optimal solution found" in low
         or "optimal solution found" in low
         or "search completed - best objective" in low
-    ) and not out["stopped_on_time"]
-    out["termination_known"] = out["stopped_on_time"] or out["proven_optimal"]
+    ) and not out["stopped_on_time"] and not out["stopped_on_gap"]
+    out["termination_known"] = (
+        out["stopped_on_time"] or out["stopped_on_gap"] or out["proven_optimal"]
+    )
 
     pats = {
         "upper_bound": [r"Objective value:\s*([-+0-9.eE]+)", r"Upper bound:\s*([-+0-9.eE]+)"],
@@ -485,7 +493,8 @@ def _resolver_prob_cbc(prob: pulp.LpProblem, tiempo_limite_seg: int, gap_rel: fl
         prob.solve(solver)
         info = _parsear_log_cbc(log_path) if log_path else {
             "lower_bound": None, "upper_bound": None, "gap_pct": None,
-            "stopped_on_time": False, "proven_optimal": False, "termination_known": False,
+            "stopped_on_time": False, "stopped_on_gap": False,
+            "proven_optimal": False, "termination_known": False,
         }
     finally:
         if log_path and os.path.exists(log_path):
@@ -591,6 +600,7 @@ def resolver_asignacion(cij: pd.DataFrame, demanda: pd.Series,
         "upper_bound": upper_bound,
         "solver_termination": {
             "stopped_on_time": bool(log_info.get("stopped_on_time", False)),
+            "stopped_on_gap": bool(log_info.get("stopped_on_gap", False)),
             "proven_optimal": bool(log_info.get("proven_optimal", False)),
         },
         "valor_objetivo": float(objetivo) if objetivo is not None else None,
@@ -970,14 +980,50 @@ def resolver_multidia(cij: pd.DataFrame, demanda_horizonte: pd.Series, setup: pd
         lower_bound = log_info.get("lower_bound")
         upper_bound = log_info.get("upper_bound") or (float(objetivo) if objetivo is not None else None)
 
+    # Si el log no entregó GAP explícito, lo reconstruimos a partir de UB y LB.
+    if (not gap_certificado and gap_pct is None and lower_bound is not None
+            and upper_bound is not None and abs(float(upper_bound)) > TOL):
+        gap_pct = abs(float(upper_bound) - float(lower_bound)) / abs(float(upper_bound)) * 100.0
+
+    max_r_dem = float(r_dem.max()) if len(r_dem) else 0.0
+    max_r_cap = float(r_cap.to_numpy().max()) if r_cap.size else 0.0
+    factible_incumbente = bool(
+        objetivo is not None
+        and max_r_dem <= 1e-6
+        and max_r_cap <= 1e-6
+    )
+    gap_objetivo_pct = None if gap_rel is None else float(gap_rel) * 100.0
+    gap_objetivo_alcanzado = bool(
+        not gap_certificado
+        and gap_pct is not None
+        and gap_objetivo_pct is not None
+        and float(gap_pct) <= gap_objetivo_pct + 1e-9
+    )
+
+    if gap_certificado:
+        estado_presentacion = "Óptimo certificado"
+    elif factible_incumbente and bool(log_info.get("stopped_on_time", False)):
+        estado_presentacion = "Factible · límite de tiempo"
+    elif factible_incumbente and (bool(log_info.get("stopped_on_gap", False)) or gap_objetivo_alcanzado):
+        estado_presentacion = "Factible · GAP objetivo"
+    elif factible_incumbente:
+        estado_presentacion = "Factible · sin certificado"
+    else:
+        estado_presentacion = estado
+
     return {
         "estado": estado,
+        "estado_presentacion": estado_presentacion,
+        "factible_incumbente": factible_incumbente,
+        "gap_objetivo_pct": gap_objetivo_pct,
+        "gap_objetivo_alcanzado": gap_objetivo_alcanzado,
         "gap_certificado": gap_certificado,
         "gap_pct": gap_pct,
         "lower_bound": lower_bound,
         "upper_bound": upper_bound,
         "solver_termination": {
             "stopped_on_time": bool(log_info.get("stopped_on_time", False)),
+            "stopped_on_gap": bool(log_info.get("stopped_on_gap", False)),
             "proven_optimal": bool(log_info.get("proven_optimal", False)),
         },
         "valor_objetivo": float(objetivo) if objetivo is not None else None,
@@ -991,8 +1037,8 @@ def resolver_multidia(cij: pd.DataFrame, demanda_horizonte: pd.Series, setup: pd
         "capacidad_min": caps,
         "cap_minutos": float(caps.iloc[0]) if caps.nunique() == 1 else caps,
         "residuos": {
-            "demanda_max": float(r_dem.max()) if len(r_dem) else 0.0,
-            "capacidad_max": float(r_cap.to_numpy().max()) if r_cap.size else 0.0,
+            "demanda_max": max_r_dem,
+            "capacidad_max": max_r_cap,
         },
     }
 

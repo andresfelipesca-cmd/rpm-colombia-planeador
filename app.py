@@ -696,7 +696,7 @@ with multi_tab:
     c1, c2, c3, c4 = st.columns(4)
     dias_habiles_input = c1.number_input("Días hábiles para estimar demanda", 60, 300, 180, 10)
     dias_horizonte = c2.slider("Horizonte de planeación (días)", 2, 7, 3)
-    tiempo_multi = c3.slider("Tiempo máximo CBC multi-día (s)", 30, 600, 120)
+    tiempo_multi = c3.slider("Tiempo máximo CBC multi-día (s)", 30, 600, 300)
     gap_obj_multi_pct = c4.select_slider("GAP objetivo multi-día", options=[0.1, 0.25, 0.5, 1.0, 2.0], value=0.5, format_func=lambda x: f"{x:.2f}%")
 
     if st.button("Calcular plan multi-día", key="run_multi"):
@@ -715,14 +715,19 @@ with multi_tab:
         st.session_state["resultado_multi"] = {
             "res": res_multi, "cal": cal, "ajuste": ajuste,
             "demanda_teorica": float(demanda_teorica.sum()), "demanda_entera": int(demanda_horizonte.sum()),
+            "demanda_horizonte": demanda_horizonte.copy(),
+            "gap_objetivo_pct": float(gap_obj_multi_pct),
+            "tiempo_limite_seg": int(tiempo_multi),
         }
 
     multi_state = st.session_state.get("resultado_multi")
     if multi_state is not None:
         res_multi = multi_state["res"]
+        gap_obj_usado = float(multi_state.get("gap_objetivo_pct", gap_obj_multi_pct))
+        tiempo_usado = int(multi_state.get("tiempo_limite_seg", tiempo_multi))
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Estado", res_multi["estado"])
-        m2.metric("Objetivo", f"{fmt_num(res_multi['valor_objetivo'], 1)} min" if res_multi["valor_objetivo"] else "N/D")
+        m1.metric("Estado", res_multi.get("estado_presentacion", res_multi["estado"]))
+        m2.metric("Objetivo", f"{fmt_num(res_multi['valor_objetivo'], 1)} min" if res_multi["valor_objetivo"] is not None else "N/D")
         m3.metric("Demanda entera del horizonte", fmt_num(multi_state["demanda_entera"], 0),
                   f"ajuste {multi_state['ajuste']:+.1f} unid.")
         gap_text = "0.00%" if res_multi["gap_certificado"] else (f"{res_multi['gap_pct']:.2f}%" if res_multi["gap_pct"] is not None else "N/D")
@@ -730,16 +735,30 @@ with multi_tab:
         st.caption(
             f"Factor de calibración de demanda extendida: {multi_state['cal']['factor_sesgo']:.3f}x. "
             f"El redondeo del horizonte se reporta explícitamente porque la variable de producción es entera. "
-            f"CBC usa un GAP objetivo de {gap_obj_multi_pct:.2f}% para equilibrar calidad de solución y tiempo de cómputo."
+            f"Esta corrida usó CBC con límite de {tiempo_usado} s y GAP objetivo de {gap_obj_usado:.2f}%."
         )
         lb_multi = res_multi.get("lower_bound")
         ub_multi = res_multi.get("upper_bound")
         b1, b2, b3 = st.columns(3)
         b1.metric("LB solver", f"{fmt_num(lb_multi, 1)} min" if lb_multi is not None else "N/D")
         b2.metric("UB / incumbente", f"{fmt_num(ub_multi, 1)} min" if ub_multi is not None else "N/D")
-        b3.metric("Criterio GAP", f"≤ {gap_obj_multi_pct:.2f}%")
-        if res_multi.get("solver_termination", {}).get("stopped_on_time"):
-            st.warning("El solver alcanzó el límite de tiempo. El plan puede ser factible, pero no se presenta como óptimo; revise UB, LB y GAP cuando estén disponibles.")
+        b3.metric("Criterio GAP", f"≤ {gap_obj_usado:.2f}%")
+
+        term = res_multi.get("solver_termination", {})
+        if res_multi.get("gap_certificado"):
+            st.success("Optimalidad exacta certificada por CBC para esta corrida.")
+        elif term.get("stopped_on_time") and res_multi.get("factible_incumbente"):
+            st.warning(
+                "CBC alcanzó el límite de tiempo. Se conserva el mejor plan factible encontrado, "
+                "pero no se presenta como óptimo. Interprete conjuntamente UB, LB y GAP."
+            )
+        elif term.get("stopped_on_gap") or res_multi.get("gap_objetivo_alcanzado"):
+            st.info(
+                "CBC alcanzó el criterio de GAP configurado. El plan es factible y acotado, "
+                "pero no se etiqueta como óptimo exacto mientras la brecha sea distinta de cero."
+            )
+        elif res_multi.get("factible_incumbente"):
+            st.info("Se encontró un incumbente factible, sin certificado de optimalidad exacta.")
 
         if len(res_multi["plan"]):
             util_pct_multi = res_multi["utilizacion_dia_maquina"].div(res_multi["capacidad_min"], axis=1) * 100
@@ -748,8 +767,54 @@ with multi_tab:
             mm1.metric("Unidades producidas", fmt_num(res_multi["plan"]["unidades"].sum(), 0))
             mm2.metric("Lote promedio", fmt_num(res_multi["plan"]["unidades"].mean(), 1))
             mm3.metric("σ utilización día-máquina", f"{util_pct_multi.stack().std(ddof=0):.1f} pts")
-            st.dataframe(res_multi["plan"].sort_values(["dia", "maquina", "unidades"], ascending=[True, True, False]),
-                         use_container_width=True, hide_index=True)
+            plan_multi_ordenado = res_multi["plan"].sort_values(
+                ["dia", "maquina", "unidades"], ascending=[True, True, False]
+            )
+            st.dataframe(plan_multi_ordenado, use_container_width=True, hide_index=True)
+
+            # Exportación completa del plan multiperiodo, como en la versión anterior de la app.
+            buffer_multi = io.BytesIO()
+            resumen_multi = pd.DataFrame([
+                {
+                    "estado": res_multi.get("estado_presentacion", res_multi.get("estado")),
+                    "estado_solver": res_multi.get("estado"),
+                    "objetivo_min": res_multi.get("valor_objetivo"),
+                    "upper_bound_min": ub_multi,
+                    "lower_bound_min": lb_multi,
+                    "gap_pct": res_multi.get("gap_pct"),
+                    "gap_objetivo_pct": gap_obj_usado,
+                    "tiempo_limite_seg": tiempo_usado,
+                    "dias_horizonte": res_multi.get("dias"),
+                    "demanda_entera_unid": multi_state.get("demanda_entera"),
+                    "ajuste_redondeo_unid": multi_state.get("ajuste"),
+                    "factor_calibracion": multi_state["cal"].get("factor_sesgo"),
+                    "residuo_demanda_max": res_multi.get("residuos", {}).get("demanda_max"),
+                    "residuo_capacidad_max": res_multi.get("residuos", {}).get("capacidad_max"),
+                }
+            ])
+            demanda_export = multi_state.get("demanda_horizonte")
+            if isinstance(demanda_export, pd.Series):
+                demanda_export = demanda_export.rename("demanda_unidades").rename_axis("producto").reset_index()
+
+            with pd.ExcelWriter(buffer_multi, engine="openpyxl") as writer:
+                resumen_multi.to_excel(writer, sheet_name="Resumen", index=False)
+                plan_multi_ordenado.to_excel(writer, sheet_name="Plan_MultiDia", index=False)
+                if isinstance(demanda_export, pd.DataFrame):
+                    demanda_export.to_excel(writer, sheet_name="Demanda_Horizonte", index=False)
+                res_multi["utilizacion_dia_maquina"].to_excel(writer, sheet_name="Utilizacion_Min")
+                util_pct_multi.to_excel(writer, sheet_name="Utilizacion_Pct")
+                res_multi["setups_dia_maquina"].to_excel(writer, sheet_name="Setups_Dia_Maquina")
+                res_multi["tiempo_produccion_dia_maquina"].to_excel(writer, sheet_name="Produccion_Min")
+                res_multi["tiempo_setup_dia_maquina"].to_excel(writer, sheet_name="Setup_Min")
+                res_multi["holgura_dia_maquina"].to_excel(writer, sheet_name="Holgura_Min")
+
+            st.download_button(
+                "Descargar plan multi-día en Excel",
+                data=buffer_multi.getvalue(),
+                file_name="plan_multidia_rpm.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
 # ---------------------------------------------------------------------------
 # Tab 6: Monte Carlo
