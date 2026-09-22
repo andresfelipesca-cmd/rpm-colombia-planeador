@@ -69,6 +69,13 @@ SLATE = "#718096"
 LIGHT = "#CBD5E1"
 GREEN = "#688F78"
 
+# Referencia de revalidación multiperiodo documentada en la tesis.
+# Estos valores pertenecen a una corrida separada y nunca sustituyen la
+# ejecución en vivo de la aplicación.
+MULTI_TESIS_UB_MIN = 34234.87
+MULTI_TESIS_LB_MIN = 34071.20
+MULTI_TESIS_GAP_PCT = 0.478
+
 st.markdown(
     f"""
     <style>
@@ -759,6 +766,28 @@ with multi_tab:
             )
         elif res_multi.get("factible_incumbente"):
             st.info("Se encontró un incumbente factible, sin certificado de optimalidad exacta.")
+
+        # Comparación transparente con la corrida de revalidación documentada.
+        # Se presenta como referencia histórica y no como resultado de esta ejecución.
+        st.markdown("#### Referencia de revalidación documentada en la tesis")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("UB documentado", f"{fmt_num(MULTI_TESIS_UB_MIN, 2)} min")
+        r2.metric("LB documentada (raíz)", f"{fmt_num(MULTI_TESIS_LB_MIN, 2)} min")
+        r3.metric("GAP conservador documentado", f"≤ {MULTI_TESIS_GAP_PCT:.3f}%")
+        if ub_multi is not None:
+            delta_ref = float(ub_multi) - MULTI_TESIS_UB_MIN
+            r4.metric(
+                "Δ UB ejecución vs. referencia",
+                f"{fmt_num(delta_ref, 2)} min",
+                help="Diferencia entre el incumbente de la ejecución actual y el incumbente documentado en la tesis. No es una brecha de optimalidad.",
+            )
+        else:
+            r4.metric("Δ UB ejecución vs. referencia", "N/D")
+        st.caption(
+            "Referencia externa a la corrida actual: UB = 34.234,87 min, LB de raíz = 34.071,20 min "
+            "y GAP conservador ≤ 0,478%. Se muestra únicamente para trazabilidad con la tesis; "
+            "el plan visible y el Excel descargable siempre corresponden a la ejecución en vivo."
+        )
 
         if len(res_multi["plan"]):
             util_pct_multi = res_multi["utilizacion_dia_maquina"].div(res_multi["capacidad_min"], axis=1) * 100
