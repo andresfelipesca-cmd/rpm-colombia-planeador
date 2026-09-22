@@ -696,7 +696,7 @@ with multi_tab:
     c1, c2, c3, c4 = st.columns(4)
     dias_habiles_input = c1.number_input("Días hábiles para estimar demanda", 60, 300, 180, 10)
     dias_horizonte = c2.slider("Horizonte de planeación (días)", 2, 7, 3)
-    tiempo_multi = c3.slider("Tiempo máximo CBC multi-día (s)", 30, 600, 300)
+    tiempo_multi = c3.slider("Tiempo máximo CBC multi-día (s)", 30, 600, 600)
     gap_obj_multi_pct = c4.select_slider("GAP objetivo multi-día", options=[0.1, 0.25, 0.5, 1.0, 2.0], value=0.5, format_func=lambda x: f"{x:.2f}%")
 
     if st.button("Calcular plan multi-día", key="run_multi"):
@@ -777,7 +777,10 @@ with multi_tab:
             resumen_multi = pd.DataFrame([
                 {
                     "estado": res_multi.get("estado_presentacion", res_multi.get("estado")),
-                    "estado_solver": res_multi.get("estado"),
+                    "estado_solver_raw": res_multi.get("estado"),
+                    "gap_certificado": bool(res_multi.get("gap_certificado")),
+                    "gap_objetivo_alcanzado": bool(res_multi.get("gap_objetivo_alcanzado")),
+                    "limite_tiempo_alcanzado": bool(res_multi.get("solver_termination", {}).get("stopped_on_time")),
                     "objetivo_min": res_multi.get("valor_objetivo"),
                     "upper_bound_min": ub_multi,
                     "lower_bound_min": lb_multi,
