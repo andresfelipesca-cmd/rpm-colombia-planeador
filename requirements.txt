@@ -4,5 +4,5 @@ numpy>=1.26
 openpyxl>=3.1
 scikit-learn>=1.4
 scipy>=1.10
-pulp>=2.8
+pulp==3.3.2
 plotly>=5.24,<7
